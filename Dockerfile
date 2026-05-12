@@ -14,5 +14,3 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Copy the application code
 COPY ./bot.py bot.py
-
-CMD ["python", "bot.py"]

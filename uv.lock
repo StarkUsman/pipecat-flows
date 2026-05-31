@@ -2174,6 +2174,9 @@ runner = [
     { name = "python-dotenv", marker = "python_full_version >= '3.11'" },
     { name = "uvicorn", marker = "python_full_version >= '3.11'" },
 ]
+tavus = [
+    { name = "daily-python", version = "0.28.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
 webrtc = [
     { name = "aiortc", marker = "python_full_version >= '3.11'" },
     { name = "opencv-python", marker = "python_full_version >= '3.11'" },
@@ -2232,12 +2235,16 @@ name = "pipecat-quickstart"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "aiohttp" },
+    { name = "loguru" },
     { name = "pipecat-ai", version = "0.0.108", source = { registry = "https://pypi.org/simple" }, extra = ["cartesia", "daily", "deepgram", "heygen", "openai", "runner", "webrtc"], marker = "python_full_version < '3.11'" },
-    { name = "pipecat-ai", version = "1.1.0", source = { registry = "https://pypi.org/simple" }, extra = ["cartesia", "daily", "deepgram", "heygen", "openai", "runner", "webrtc"], marker = "python_full_version >= '3.11'" },
+    { name = "pipecat-ai", version = "1.1.0", source = { registry = "https://pypi.org/simple" }, extra = ["cartesia", "daily", "deepgram", "heygen", "openai", "runner", "tavus", "webrtc"], marker = "python_full_version >= '3.11'" },
     { name = "pipecat-ai-flows", version = "0.0.24", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pipecat-ai-flows", version = "1.1.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pipecatcloud", version = "0.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pipecatcloud", version = "0.7.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "python-dotenv" },
+    { name = "websockets" },
 ]
 
 [package.dev-dependencies]
@@ -2247,9 +2254,13 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "pipecat-ai", extras = ["cartesia", "daily", "deepgram", "heygen", "local-smart-turn-v3", "openai", "runner", "silero", "webrtc"], specifier = ">=0.0.86" },
+    { name = "aiohttp", specifier = ">=3.9.0" },
+    { name = "loguru", specifier = ">=0.7.0" },
+    { name = "pipecat-ai", extras = ["tavus", "cartesia", "daily", "deepgram", "heygen", "local-smart-turn-v3", "openai", "runner", "silero", "webrtc"], specifier = ">=0.0.86" },
     { name = "pipecat-ai-flows", specifier = ">=0.0.21" },
     { name = "pipecatcloud", specifier = ">=0.2.4" },
+    { name = "python-dotenv", specifier = ">=1.0.0" },
+    { name = "websockets", specifier = ">=12.0" },
 ]
 
 [package.metadata.requires-dev]

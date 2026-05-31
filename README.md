@@ -21,6 +21,8 @@ You'll need API keys from three services:
 - [OpenAI](https://auth.openai.com/create-account) for LLM inference
 - [Cartesia](https://play.cartesia.ai/sign-up) for Text-to-Speech
 
+If Cartesia becomes slow or unavailable in production, set `TTS_PROVIDER=deepgram` to use the built-in fallback voice.
+
 > 💡 **Tip**: Sign up for all three now. You'll need them for both local and cloud deployment.
 
 ### Setup
@@ -48,6 +50,7 @@ Navigate to the quickstart directory and set up your environment.
    DEEPGRAM_API_KEY=your_deepgram_api_key
    OPENAI_API_KEY=your_openai_api_key
    CARTESIA_API_KEY=your_cartesia_api_key
+   TTS_PROVIDER=cartesia
    ```
 
 3. Set up a virtual environment and install dependencies

@@ -21,6 +21,7 @@ Run the bot using:
 """
 
 import os
+import re
 import aiohttp
 
 from dotenv import load_dotenv
@@ -55,9 +56,11 @@ from pipecat.transports.daily.transport import DailyParams
 # Service imports
 from pipecat.services.cartesia.tts import CartesiaTTSService
 from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.heygen.api_interactive_avatar import AvatarQuality, NewSessionRequest
-from pipecat.services.heygen.video import HeyGenVideoService
+#from pipecat.services.heygen.video import HeyGenVideoService
+from pipecat.services.tavus.video import TavusVideoService
 
 # Pipecat Flows imports
 from pipecat_flows import FlowManager, FlowsFunctionSchema, FlowArgs, NodeConfig
@@ -67,7 +70,19 @@ logger.info("✅ All components loaded successfully!")
 
 load_dotenv(override=True)
 
-SYSTEM_PROMPT = "You are a friendly and professional AI assistant for a creative agency. Your goal is to qualify new leads by asking a few simple questions. You must ALWAYS use the provided functions to progress the conversation. This is a voice conversation, so keep your responses natural and concise. Do not use emojis or markdown."
+SYSTEM_PROMPT = """
+You are a friendly and professional AI assistant for a creative agency.
+
+Your goal is to qualify new leads by asking a few simple questions.
+
+Only call a function when the user has clearly provided the required information.
+
+If information is missing or unclear, ask follow-up questions.
+
+This is a voice conversation, so keep responses natural and concise.
+
+Do not use emojis or markdown.
+"""
 ROLE_MESSAGES = [{"role": "system", "content": SYSTEM_PROMPT}]
 
 def create_greeting_node() -> NodeConfig:
@@ -93,6 +108,47 @@ def create_greeting_node() -> NodeConfig:
     )
 
 
+def _normalize_budget_value(value: object) -> int:
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, float):
+        return int(value)
+
+    text = str(value)
+    digits = re.sub(r"[^0-9]", "", text)
+    return int(digits) if digits else 0
+
+
+def _build_tts_service():
+    provider = os.getenv("TTS_PROVIDER", "cartesia").strip().lower()
+
+    if provider == "deepgram":
+        logger.warning("Using Deepgram TTS because TTS_PROVIDER=deepgram")
+        return DeepgramTTSService(
+            api_key=os.getenv("DEEPGRAM_API_KEY"),
+            settings=DeepgramTTSService.Settings(
+                voice=os.getenv("DEEPGRAM_TTS_VOICE", "aura-2-helena-en"),
+            ),
+        )
+
+    try:
+        return CartesiaTTSService(
+            api_key=os.getenv("CARTESIA_API_KEY"),
+            settings=CartesiaTTSService.Settings(
+                voice=os.getenv("CARTESIA_TTS_VOICE", "e07c00bc-4134-4eae-9ea4-1a55fb45746b"),
+            ),
+        )
+    except Exception as error:
+        logger.warning(f"Cartesia TTS failed to initialize, falling back to Deepgram TTS: {error}")
+        return DeepgramTTSService(
+            api_key=os.getenv("DEEPGRAM_API_KEY"),
+            settings=DeepgramTTSService.Settings(
+                voice=os.getenv("DEEPGRAM_TTS_VOICE", "aura-2-helena-en"),
+            ),
+        )
+
+
 def create_get_budget_node(flow_manager: FlowManager) -> NodeConfig:
 
     name = flow_manager.state.get("name")
@@ -109,7 +165,7 @@ def create_get_budget_node(flow_manager: FlowManager) -> NodeConfig:
                 name="record_budget",
                 handler=handle_budget,
                 description="Call this function when the user provides their project budget.",
-                properties={"budget": {"type": "number", "description": "The user's approximate project budget in dollars."}},
+                properties={"budget": {"type": "string", "description": "The user's approximate project budget in dollars."}},
                 required=["budget"]
             )
         ]
@@ -170,7 +226,7 @@ def create_qualify_node() -> NodeConfig:
                 name="book_meeting",
                 handler=handle_booking, # Link to the booking handler
                 description="Call this function when the user provides their email address to book the meeting.",
-                properties={"email": {"type": "string"}},
+                properties={"email": {"type": "string", "description": "Valid email address of the user"}},
                 required=["email"],
             )
         ]
@@ -218,7 +274,7 @@ async def handle_name(args: FlowArgs, flow_manager: FlowManager) -> tuple[None, 
     return (None, create_get_budget_node(flow_manager))
 
 async def handle_budget(args: FlowArgs, flow_manager: FlowManager) -> tuple[None, NodeConfig]:
-    budget = args["budget"]
+    budget = _normalize_budget_value(args["budget"])
     logger.info(f"User's budget is: {budget}")
     flow_manager.state.update({"budget": budget})
     return (None, create_get_timeline_node())
@@ -234,13 +290,16 @@ async def handle_service_and_qualify(args: FlowArgs, flow_manager: FlowManager) 
     flow_manager.state.update({"service": args["service_needed"]})
 
     # --- Qualification logic ---
-    budget = flow_manager.state.get("budget", 0)
+    budget = _normalize_budget_value(flow_manager.state.get("budget", 0))
 
     if budget >= 5000:
         logger.info("User is qualified")
         return (None, create_qualify_node())
     else:
         logger.info("User is not qualified")
+        logger.info("#############################################################")
+        logger.info(f"Name: {flow_manager.state.get('name')}")
+        logger.info("#############################################################")
         return (None, create_unqualified_node())
 
 async def handle_booking(args: FlowArgs, flow_manager: FlowManager) -> tuple[None, NodeConfig]:
@@ -257,7 +316,6 @@ async def handle_booking(args: FlowArgs, flow_manager: FlowManager) -> tuple[Non
     return (None, create_end_node())
 
 async def handle_end_conversation(args: FlowArgs, flow_manager: FlowManager) -> tuple[None, NodeConfig]:
-
     logger.info("Conversation ended")
     return (None, create_end_node())
 
@@ -267,11 +325,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         logger.info(f"Starting bot")
 
         stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
-
-        tts = CartesiaTTSService(
-            api_key=os.getenv("CARTESIA_API_KEY"),
-            voice_id="e07c00bc-4134-4eae-9ea4-1a55fb45746b",  
-        )
+        tts = _build_tts_service()
 
         #llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
         llm = OpenAILLMService(
@@ -279,6 +333,12 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             base_url=os.getenv("OPENAI_BASE_URL"),
             model=os.getenv("OPENAI_MODEL"),
         )
+
+        # tavus = TavusVideoService(
+        #     api_key=os.getenv("TAVUS_API_KEY"),
+        #     replica_id=os.getenv("TAVUS_REPLICA_ID"),
+        #     session=session,
+        # )
 
 #        heygen = HeyGenVideoService(
 #            api_key=os.getenv("HEYGEN_API_KEY"),
@@ -303,7 +363,8 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
                 context_aggregator.user(),  # User responses
                 llm,  # LLM
                 tts,  # TTS
-#                heygen,  # HeyGen video service
+                # tavus,
+                #                heygen,  # HeyGen video service
                 transport.output(),  # Transport bot output
                 context_aggregator.assistant(),  # Assistant spoken responses
             ]
@@ -341,7 +402,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
 
         await runner.run(task)
-
 
 async def bot(runner_args: RunnerArguments):
     """Main bot entry point for the bot starter."""

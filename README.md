@@ -15,13 +15,13 @@ Build and deploy your first voice AI bot in under 10 minutes. Develop locally, t
 
 #### AI Service API keys
 
-You'll need API keys from three services:
+You'll need API keys from two required services, plus Cartesia if you want that TTS voice:
 
 - [Deepgram](https://console.deepgram.com/signup) for Speech-to-Text
 - [OpenAI](https://auth.openai.com/create-account) for LLM inference
-- [Cartesia](https://play.cartesia.ai/sign-up) for Text-to-Speech
+- [Cartesia](https://play.cartesia.ai/sign-up) for optional Text-to-Speech
 
-If Cartesia becomes slow or unavailable in production, set `TTS_PROVIDER=deepgram` to use the built-in fallback voice.
+Deepgram TTS is the default fallback voice, so the bot still starts even if Cartesia is unavailable.
 
 > 💡 **Tip**: Sign up for all three now. You'll need them for both local and cloud deployment.
 
@@ -50,7 +50,7 @@ Navigate to the quickstart directory and set up your environment.
    DEEPGRAM_API_KEY=your_deepgram_api_key
    OPENAI_API_KEY=your_openai_api_key
    CARTESIA_API_KEY=your_cartesia_api_key
-   TTS_PROVIDER=cartesia
+   TTS_PROVIDER=deepgram
    ```
 
 3. Set up a virtual environment and install dependencies
@@ -66,6 +66,8 @@ uv run bot.py
 ```
 
 **Open http://localhost:7860 in your browser** and click `Connect` to start talking to your bot.
+
+If you want Cartesia TTS, set `TTS_PROVIDER=cartesia` and provide a valid `CARTESIA_API_KEY`.
 
 > 💡 First run note: The initial startup may take ~20 seconds as Pipecat downloads required models and imports.
 

@@ -210,3 +210,42 @@ def create_end_node() -> NodeConfig:
             {"type": "end_conversation"}
         ],
     )
+
+# FlowManager Setup
+# 
+# Initialize the FlowManager in your bot setup:
+#
+# async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
+#     stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+#     tts = CartesiaTTSService(api_key=os.getenv("CARTESIA_API_KEY"))
+#     llm = create_llm()  # Your LLM service
+#     
+#     context = LLMContext()
+#     context_aggregator = LLMContextAggregatorPair(context)
+#     
+#     pipeline = Pipeline([
+#         transport.input(),
+#         stt,
+#         context_aggregator.user(),
+#         llm,
+#         tts,
+#         transport.output(),
+#         context_aggregator.assistant(),
+#     ])
+#     
+#     task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
+#     
+#     # Initialize FlowManager
+#     flow_manager = FlowManager(
+#         task=task,
+#         llm=llm,
+#         context_aggregator=context_aggregator,
+#         transport=transport,
+#         # global_functions=[],
+#     )
+#     
+#     @transport.event_handler("on_client_connected")
+#     async def on_client_connected(transport, client):
+#         logger.info("Client connected")
+#         # Start the flow with the initial node
+#         await flow_manager.initialize(create_initial_node())

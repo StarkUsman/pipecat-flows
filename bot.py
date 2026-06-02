@@ -96,13 +96,21 @@ async def _start_api_server():
         return
     _api_server_started = True
 
+    _TYPING_NAMES = {"Any", "Optional", "Union", "List", "Dict", "Tuple", "Set", "Type", "Callable"}
+    _TYPING_HEADER = "from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union\n"
+
     async def deploy_new_flow(request: web.Request) -> web.Response:
         try:
             body = await request.json()
             code = body.get("code")
-            logger.info(repr(code[:500]))
             if not code:
                 return web.json_response({"error": "Missing 'code' field in request body"}, status=400)
+
+            # Inject typing imports if the code uses typing names without importing them
+            needs_typing = any(name in code for name in _TYPING_NAMES)
+            has_typing_import = "from typing import" in code or "import typing" in code
+            if needs_typing and not has_typing_import:
+                code = _TYPING_HEADER + code
 
             try:
                 compile(code, "flow.py", "exec")
@@ -265,7 +273,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport, client):
             logger.info(f"Client connected")
-            importlib.reload(flow_module)
+            try:
+                importlib.reload(flow_module)
+            except Exception as exc:
+                logger.error(f"flow.py reload failed, using last good version: {exc}")
             # await flow_manager.initialize(flow_module.create_greeting_node())
             await flow_manager.initialize(flow_module.create_initial_node())
 

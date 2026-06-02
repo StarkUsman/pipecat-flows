@@ -28,8 +28,12 @@ Required AI services:
 - HeyGen (Avatar Video)
 """
 
+import asyncio
+import importlib
 import os
+
 import aiohttp
+from aiohttp import web
 
 from dotenv import load_dotenv
 from loguru import logger
@@ -73,12 +77,78 @@ from pipecat.services.tavus.video import TavusVideoService
 from pipecat_flows import FlowManager
 
 # Conversation flow (nodes + handlers) lives in its own module.
+# Imported as a module so it can be hot-reloaded between sessions.
 # from flow import create_greeting_node
-from flow import create_initial_node
+import flow as flow_module
 
 logger.info("✅ All components loaded successfully!")
 
 load_dotenv(override=True)
+
+_FLOW_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow.py")
+_api_server_started = False
+_api_server_thread_started = False
+
+
+async def _start_api_server():
+    global _api_server_started
+    if _api_server_started:
+        return
+    _api_server_started = True
+
+    async def deploy_new_flow(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+            code = body.get("code")
+            logger.info(repr(code[:500]))
+            if not code:
+                return web.json_response({"error": "Missing 'code' field in request body"}, status=400)
+
+            try:
+                compile(code, "flow.py", "exec")
+            except SyntaxError as exc:
+                return web.json_response({"error": f"Syntax error in submitted code: {exc}"}, status=400)
+
+            with open(_FLOW_PATH, "w") as fh:
+                fh.write(code)
+
+            logger.info("flow.py updated via /deployNewFlow")
+            return web.json_response({"status": "ok", "message": "flow.py updated — takes effect on next client connection"})
+
+        except Exception as exc:
+            logger.error(f"/deployNewFlow error: {exc}")
+            return web.json_response({"error": str(exc)}, status=500)
+
+    app = web.Application()
+    app.router.add_post("/deployNewFlow", deploy_new_flow)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("FLOW_API_PORT", "8080"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Flow API server listening on :{port} — POST /deployNewFlow")
+
+
+async def _serve_api_server_forever():
+    await _start_api_server()
+    await asyncio.Event().wait()
+
+
+def _ensure_api_server_thread():
+    global _api_server_thread_started
+    if _api_server_thread_started:
+        return
+
+    import threading
+
+    _api_server_thread_started = True
+    thread = threading.Thread(
+        target=lambda: asyncio.run(_serve_api_server_forever()),
+        daemon=True,
+        name="flow-api-server",
+    )
+    thread.start()
 
 
 def _build_tts_service():
@@ -125,7 +195,6 @@ def _build_tts_service():
 
 
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
-
     async with aiohttp.ClientSession() as session:
         logger.info(f"Starting bot")
 
@@ -196,9 +265,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport, client):
             logger.info(f"Client connected")
-            # Kick off the conversation.
-            # await flow_manager.initialize(create_greeting_node())
-            await flow_manager.initialize(create_initial_node())
+            importlib.reload(flow_module)
+            # await flow_manager.initialize(flow_module.create_greeting_node())
+            await flow_manager.initialize(flow_module.create_initial_node())
 
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(transport, client):
@@ -249,4 +318,5 @@ async def bot(runner_args: RunnerArguments):
 if __name__ == "__main__":
     from pipecat.runner.run import main
 
+    _ensure_api_server_thread()
     main()

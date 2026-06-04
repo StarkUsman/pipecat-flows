@@ -90,6 +90,26 @@ _api_server_started = False
 _api_server_thread_started = False
 
 
+def _cors_headers(request: web.Request) -> dict[str, str]:
+    request_headers = request.headers.get("Access-Control-Request-Headers")
+    return {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": request_headers or "*",
+        "Access-Control-Max-Age": "86400",
+    }
+
+
+@web.middleware
+async def _cors_middleware(request: web.Request, handler):
+    if request.method == "OPTIONS":
+        return web.Response(status=204, headers=_cors_headers(request))
+
+    response = await handler(request)
+    response.headers.update(_cors_headers(request))
+    return response
+
+
 async def _start_api_server():
     global _api_server_started
     if _api_server_started:
@@ -127,8 +147,9 @@ async def _start_api_server():
             logger.error(f"/deployNewFlow error: {exc}")
             return web.json_response({"error": str(exc)}, status=500)
 
-    app = web.Application()
+    app = web.Application(middlewares=[_cors_middleware])
     app.router.add_post("/deployNewFlow", deploy_new_flow)
+    app.router.add_options("/deployNewFlow", lambda request: web.Response(status=204))
 
     runner = web.AppRunner(app)
     await runner.setup()

@@ -30,6 +30,7 @@ Required AI services:
 
 import asyncio
 import importlib
+import importlib.util
 import os
 
 import aiohttp
@@ -77,16 +78,28 @@ from pipecat.services.tavus.video import TavusVideoService
 from pipecat_flows import FlowManager
 
 # Conversation flow (nodes + handlers) lives in its own module.
-# Imported as a module so it can be hot-reloaded between sessions.
+# Loaded dynamically so FLOW_PATH env var can point to any agent-specific file.
 # from flow import create_greeting_node
-import flow as flow_module
 
 logger.info("✅ All components loaded successfully!")
 
 load_dotenv(override=True)
 
-_FLOW_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow.py")
+_FLOW_PATH = os.environ.get(
+    "FLOW_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow.py"),
+)
 _api_server_started = False
+
+
+def _load_flow_module(path: str):
+    spec = importlib.util.spec_from_file_location("flow_module", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+flow_module = _load_flow_module(_FLOW_PATH)
 _api_server_thread_started = False
 
 
@@ -294,8 +307,9 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport, client):
             logger.info(f"Client connected")
+            global flow_module
             try:
-                importlib.reload(flow_module)
+                flow_module = _load_flow_module(_FLOW_PATH)
             except Exception as exc:
                 logger.error(f"flow.py reload failed, using last good version: {exc}")
             # await flow_manager.initialize(flow_module.create_greeting_node())

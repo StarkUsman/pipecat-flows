@@ -1,168 +1,320 @@
-# Pipecat Quickstart
+# Pipecat Voice AI — Multi-Agent Platform
 
-Build and deploy your first voice AI bot in under 10 minutes. Develop locally, then scale to production on Pipecat Cloud.
+A pipecat-based voice AI platform that supports both **single-agent** local development and a **dynamic multi-agent runtime** where agents are created, configured, and destroyed via REST API at runtime.
 
-**Two steps**: [🏠 Local Development](#run-your-bot-locally) → [☁️ Production Deployment](#deploy-to-production)
+---
 
-## Step 1: Local Development (5 min)
+## Architecture Overview
 
-### Prerequisites
+```
+manager.py  (Admin REST API — port 8080)
+  ├── POST   /agents              → create + start a new agent
+  ├── GET    /agents              → list all agents
+  ├── GET    /agents/{id}         → get single agent details
+  ├── PUT    /agents/{id}/flow    → hot-update an agent's flow code
+  ├── PUT    /agents/{id}/activate    → start a stopped agent
+  ├── PUT    /agents/{id}/deactivate  → stop without losing config
+  └── DELETE /agents/{id}        → permanently remove an agent
 
-#### Environment
+bot.py  (per-agent subprocess — WebRTC on port 7860, 7861, ...)
+  └── Loads flow from FLOW_PATH env var (per-agent flow.py)
+
+flow.py  (default standalone flow — used when running bot.py directly)
+
+agents/
+  registry.json          ← persisted agent registry (auto-generated)
+  {agent-id}/
+    flow.py              ← per-agent flow code (written by manager)
+    config.json          ← per-agent metadata
+```
+
+---
+
+## Prerequisites
 
 - Python 3.10 or later
-- [uv](https://docs.astral.sh/uv/getting-started/installation/) package manager installed
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) package manager
+- API keys from:
+  - [Deepgram](https://console.deepgram.com/signup) — Speech-to-Text (and fallback TTS)
+  - [OpenAI](https://auth.openai.com/create-account) — LLM inference
+  - [Cartesia](https://play.cartesia.ai/sign-up) — Text-to-Speech (optional, falls back to Deepgram TTS)
 
-#### AI Service API keys
-
-You'll need API keys from two required services, plus Cartesia if you want that TTS voice:
-
-- [Deepgram](https://console.deepgram.com/signup) for Speech-to-Text
-- [OpenAI](https://auth.openai.com/create-account) for LLM inference
-- [Cartesia](https://play.cartesia.ai/sign-up) for optional Text-to-Speech
-
-Deepgram TTS is the default fallback voice, so the bot still starts even if Cartesia is unavailable.
-
-> 💡 **Tip**: Sign up for all three now. You'll need them for both local and cloud deployment.
-
-### Setup
-
-Navigate to the quickstart directory and set up your environment.
-
-1. Clone this repository
-
-   ```bash
-   git clone https://github.com/pipecat-ai/pipecat-quickstart.git
-   cd pipecat-quickstart
-   ```
-
-2. Configure your API keys:
-
-   Create a `.env` file:
-
-   ```bash
-   cp env.example .env
-   ```
-
-   Then, add your API keys:
-
-   ```ini
-   DEEPGRAM_API_KEY=your_deepgram_api_key
-   OPENAI_API_KEY=your_openai_api_key
-   CARTESIA_API_KEY=your_cartesia_api_key
-   TTS_PROVIDER=deepgram
-   ```
-
-3. Set up a virtual environment and install dependencies
-
-   ```bash
-   uv sync
-   ```
-
-### Run your bot locally
+Install dependencies:
 
 ```bash
+uv sync
+```
+
+---
+
+## Mode 1 — Single Agent (standalone)
+
+Run a single bot directly using the default `flow.py`:
+
+```bash
+cp env.example .env   # add your API keys
 uv run bot.py
 ```
 
-**Open http://localhost:7860 in your browser** and click `Connect` to start talking to your bot.
+Open `http://localhost:7860` in your browser and click **Connect**.
 
-If you want Cartesia TTS, set `TTS_PROVIDER=cartesia` and provide a valid `CARTESIA_API_KEY`.
+To update the flow at runtime without restarting, POST new Python code to the sidecar API:
 
-> 💡 First run note: The initial startup may take ~20 seconds as Pipecat downloads required models and imports.
+```bash
+curl -X POST http://localhost:8080/deployNewFlow \
+  -H "Content-Type: application/json" \
+  -d '{"code": "<your flow.py contents>"}'
+```
 
-🎉 **Success!** Your bot is running locally. Now let's deploy it to production so others can use it.
+> First run may take ~20 seconds while Pipecat downloads models.
 
 ---
 
-## Step 2: Deploy to Production (5 min)
+## Mode 2 — Multi-Agent Manager
 
-Transform your local bot into a production-ready service. Pipecat Cloud handles scaling, monitoring, and global deployment.
+The manager runs as a standalone process and dynamically spawns isolated `bot.py` subprocesses, each with its own flow file, API keys, and WebRTC port.
 
-### Prerequisites
+### Start the manager
 
-1. [Sign up for Pipecat Cloud](https://pipecat.daily.co/sign-up).
+```bash
+python manager.py
+```
 
-2. Set up Docker for building your bot image:
+The manager listens on port **8080** by default. Agents are assigned WebRTC ports starting at **7860**.
 
-   - **Install [Docker](https://www.docker.com/)** on your system
-   - **Create a [Docker Hub](https://hub.docker.com/) account**
-   - **Login to Docker Hub:**
+Environment variable overrides:
 
-     ```bash
-     docker login
-     ```
+| Variable | Default | Purpose |
+|---|---|---|
+| `MANAGER_PORT` | `8080` | Admin API port |
+| `AGENT_BASE_PORT` | `7860` | First agent WebRTC port |
+| `FLOW_API_BASE_PORT` | `18000` | First per-agent sidecar port |
 
-3. Log in with the `pipecatcloud` CLI—installed with the quickstart project—is used to manage your deployment and secrets.
+---
 
-   ```bash
-   uv run pcc auth login
-   ```
+## REST API Reference
 
-   > Tip: Use the CLI with the `pcc` command alias.
+### Create an agent
 
-### Configure your deployment
+```
+POST /agents
+```
 
-The `pcc-deploy.toml` file tells Pipecat Cloud how to run your bot. **Update the image field** with your Docker Hub username by editing `pcc-deploy.toml`.
+```json
+{
+  "name": "interview-bot",
+  "flow_code": "<contents of a valid flow.py>",
+  "config": {
+    "OPENAI_API_KEY": "sk-...",
+    "OPENAI_MODEL": "gpt-4o",
+    "OPENAI_BASE_URL": "https://api.openai.com/v1",
+    "DEEPGRAM_API_KEY": "...",
+    "CARTESIA_API_KEY": "...",
+    "TTS_PROVIDER": "cartesia"
+  }
+}
+```
+
+Response `201`:
+
+```json
+{
+  "id": "abc123",
+  "name": "interview-bot",
+  "port": 7860,
+  "status": "running",
+  "client_url": "http://localhost:7860/client",
+  "created_at": "2024-01-01T00:00:00+00:00"
+}
+```
+
+---
+
+### List all agents
+
+```
+GET /agents
+```
+
+Response `200`:
+
+```json
+[
+  { "id": "abc123", "name": "interview-bot", "port": 7860, "status": "running", "created_at": "..." },
+  { "id": "def456", "name": "support-bot",   "port": 7861, "status": "inactive", "created_at": "..." }
+]
+```
+
+---
+
+### Get a single agent
+
+```
+GET /agents/{id}
+```
+
+Response `200`:
+
+```json
+{
+  "id": "abc123",
+  "name": "interview-bot",
+  "port": 7860,
+  "flow_api_port": 18000,
+  "status": "running",
+  "client_url": "http://localhost:7860/client",
+  "created_at": "..."
+}
+```
+
+---
+
+### Update an agent's flow (hot reload)
+
+```
+PUT /agents/{id}/flow
+```
+
+```json
+{ "flow_code": "<new flow.py contents>" }
+```
+
+The new flow takes effect on the next client connection — no restart required.
+
+Response `200`:
+
+```json
+{ "status": "ok", "message": "Flow updated — takes effect on next client connection" }
+```
+
+---
+
+### Deactivate an agent (stop, keep config)
+
+```
+PUT /agents/{id}/deactivate
+```
+
+Stops the subprocess. Config, flow file, and port reservation are preserved.
+
+Response `200`:
+
+```json
+{ "status": "ok", "message": "Agent stopped" }
+```
+
+---
+
+### Activate an agent (restart)
+
+```
+PUT /agents/{id}/activate
+```
+
+Re-spawns the subprocess using the saved flow and config on the same port.
+
+Response `200`:
+
+```json
+{ "status": "ok", "port": 7860, "client_url": "http://localhost:7860/client" }
+```
+
+---
+
+### Delete an agent
+
+```
+DELETE /agents/{id}
+```
+
+Terminates the subprocess (if running), frees the port, removes the agent directory, and removes the registry entry.
+
+Response `200`:
+
+```json
+{ "status": "ok" }
+```
+
+---
+
+## Port Scheme
+
+| Port range | Purpose |
+|---|---|
+| 8080 | Manager admin API |
+| 7860, 7861, 7862, ... | Agent WebRTC ports (one per agent) |
+| 18000, 18001, 18002, ... | Per-agent flow sidecar API ports |
+
+---
+
+## Persistence
+
+The registry is saved to `agents/registry.json` after every state change using an atomic write (write to `.tmp`, then rename). On manager startup, all agents with `status: "running"` are automatically re-spawned. Agents with `status: "inactive"` remain inactive until explicitly activated.
+
+---
+
+## Config Keys Reference
+
+| Key | Required | Purpose |
+|---|---|---|
+| `OPENAI_API_KEY` | Yes | LLM inference |
+| `OPENAI_MODEL` | No | LLM model name (default: provider default) |
+| `OPENAI_BASE_URL` | No | Custom LLM endpoint |
+| `DEEPGRAM_API_KEY` | Yes | STT and fallback TTS |
+| `CARTESIA_API_KEY` | No | Cartesia TTS (falls back to Deepgram if missing) |
+| `TTS_PROVIDER` | No | `"cartesia"` or `"deepgram"` (default: `"deepgram"`) |
+| `DEEPGRAM_TTS_VOICE` | No | Deepgram voice ID |
+| `CARTESIA_TTS_VOICE` | No | Cartesia voice ID |
+
+---
+
+## Backwards Compatibility
+
+Running `bot.py` directly (without the manager) still works exactly as before. If `FLOW_PATH` is not set, the bot loads `flow.py` from its own directory. The manager is an optional layer on top.
+
+---
+
+## Security Note
+
+The `/agents` API accepts arbitrary Python code executed in a subprocess. In production, protect this endpoint with an API key header, IP allowlist, or auth middleware. Do not expose port 8080 publicly without authentication.
+
+---
+
+## Deploy to Production (Pipecat Cloud)
+
+For single-agent cloud deployment, use the Pipecat Cloud CLI:
+
+```bash
+uv run pcc auth login
+```
+
+Update `pcc-deploy.toml` with your Docker Hub username:
 
 ```ini
 agent_name = "quickstart"
-image = "YOUR_DOCKERHUB_USERNAME/quickstart:0.1"  # 👈 Update this line
+image = "YOUR_DOCKERHUB_USERNAME/quickstart:0.1"
 secret_set = "quickstart-secrets"
 
 [scaling]
-	min_agents = 1
+    min_agents = 1
 ```
 
-**Understanding the TOML file settings:**
-
-- `agent_name`: Your bot's name in Pipecat Cloud
-- `image`: The Docker image to deploy (format: `username/image:version`)
-- `secret_set`: Where your API keys are stored securely
-- `min_agents`: Number of bot instances to keep ready (1 = instant start)
-
-> 💡 Tip: [Set up `image_credentials`](https://docs.pipecat.ai/deployment/pipecat-cloud/fundamentals/secrets#image-pull-secrets) in your TOML file for authenticated image pulls
-
-### Configure secrets
-
-Upload your API keys to Pipecat Cloud's secure storage:
+Upload secrets and deploy:
 
 ```bash
 uv run pcc secrets set quickstart-secrets --file .env
-```
-
-This creates a secret set called `quickstart-secrets` (matching your TOML file) and uploads all your API keys from `.env`.
-
-### Build and deploy
-
-Build your Docker image and push to Docker Hub:
-
-```bash
 uv run pcc docker build-push
-```
-
-Deploy to Pipecat Cloud:
-
-```bash
 uv run pcc deploy
 ```
 
-### Connect to your agent
-
-1. Open your [Pipecat Cloud dashboard](https://pipecat.daily.co/)
-2. Select your `quickstart` agent → **Sandbox**
-3. Allow microphone access and click **Connect**
+See [Pipecat Cloud docs](https://docs.pipecat.ai/) for multi-agent cloud deployment options.
 
 ---
 
-## What's Next?
-
-**🔧 Customize your bot**: Modify `bot.py` to change personality, add functions, or integrate with your data  
-**📚 Learn more**: Check out [Pipecat's docs](https://docs.pipecat.ai/) for advanced features  
-**💬 Get help**: Join [Pipecat's Discord](https://discord.gg/pipecat) to connect with the community
-
-### Troubleshooting
+## Troubleshooting
 
 - **Browser permissions**: Allow microphone access when prompted
+- **Port already in use**: Another process is on 7860 or 8080 — set `AGENT_BASE_PORT` or `MANAGER_PORT` env vars
 - **Connection issues**: Try a different browser or check VPN/firewall settings
 - **Audio issues**: Verify microphone and speakers are working and not muted
+- **Agent stuck as running after crash**: Call `PUT /agents/{id}/deactivate` then `PUT /agents/{id}/activate` to reset it

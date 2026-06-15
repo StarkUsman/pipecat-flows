@@ -1,0 +1,176 @@
+================================================================================
+ PIPECAT MULTI-AGENT PLATFORM — USAGE SUMMARY
+================================================================================
+
+This file is a quick-reference for running the project and creating/managing
+voice agents at runtime. For full architecture details and design rationale,
+see finalPlan.md. For the full API reference, see README.md.
+
+
+--------------------------------------------------------------------------------
+1. TWO WAYS TO RUN THE PROJECT
+--------------------------------------------------------------------------------
+
+A) SINGLE AGENT (original, unchanged)
+   --------------------------------------------------------
+   Command:   uv run bot.py
+   Result:    One agent on http://localhost:7860 using flow.py
+   Use when:  You just want the original single-bot setup. Fully
+              backwards compatible — nothing about this path changed.
+
+B) MULTI-AGENT MANAGER (new — for dynamic agent creation)
+   --------------------------------------------------------
+   Command:   python manager.py
+   Result:    Admin REST API starts on http://localhost:8080
+   Important: This does NOT start any voice agent by itself. It's a
+              control plane. Agents only start when you POST to /agents.
+              Each created agent runs as its own isolated bot.py
+              subprocess on its own port (7860, 7861, 7862, ...).
+
+   You do not run both bot.py and manager.py for the same purpose —
+   pick (A) for simple local dev, or (B) if you need multiple
+   independently-configured agents running at once.
+
+
+--------------------------------------------------------------------------------
+2. CREATING A NEW AGENT (with its own flow + config)
+--------------------------------------------------------------------------------
+
+Endpoint:  POST http://localhost:8080/agents
+
+Body:
+{
+  "name": "interview-bot",
+  "flow_code": "<the ENTIRE contents of a valid flow.py as a string>",
+  "config": {
+    "OPENAI_API_KEY": "sk-...",
+    "OPENAI_MODEL": "gpt-4o",
+    "OPENAI_BASE_URL": "https://api.openai.com/v1",
+    "DEEPGRAM_API_KEY": "...",
+    "CARTESIA_API_KEY": "...",
+    "TTS_PROVIDER": "cartesia"
+  }
+}
+
+Example curl:
+  curl -X POST http://localhost:8080/agents \
+    -H "Content-Type: application/json" \
+    -d '{
+      "name": "interview-bot",
+      "flow_code": "<flow.py contents>",
+      "config": {
+        "OPENAI_API_KEY": "sk-...",
+        "OPENAI_MODEL": "gpt-4o",
+        "DEEPGRAM_API_KEY": "..."
+      }
+    }'
+
+Response (201):
+{
+  "id": "abc123",
+  "name": "interview-bot",
+  "port": 7860,
+  "status": "running",
+  "client_url": "http://localhost:7860/client",
+  "created_at": "2024-01-01T00:00:00+00:00"
+}
+
+What happens behind the scenes:
+  - Manager allocates the next free port (starting at 7860)
+  - Writes flow_code to agents/<id>/flow.py
+  - Spawns an isolated `bot.py` subprocess with that flow + config as env vars
+  - Returns client_url — open it in a browser to talk to the new agent
+
+Create a second agent with a different config/flow -> gets port 7861 and
+runs simultaneously, fully isolated from the first.
+
+
+--------------------------------------------------------------------------------
+3. MANAGING EXISTING AGENTS
+--------------------------------------------------------------------------------
+
+  List all agents:
+    GET /agents
+    -> [{ "id", "name", "port", "status": "running|inactive", "created_at" }, ...]
+
+  Get one agent's details:
+    GET /agents/{id}
+    -> includes flow_api_port, client_url, status
+
+  Hot-update an agent's flow (no restart needed):
+    PUT /agents/{id}/flow
+    Body: { "flow_code": "<new flow.py contents>" }
+    -> takes effect on the NEXT client connection
+
+  Pause an agent (keeps its config + flow + port reservation):
+    PUT /agents/{id}/deactivate
+
+  Resume a paused agent:
+    PUT /agents/{id}/activate
+    -> restarts on the SAME port
+
+  Permanently delete an agent:
+    DELETE /agents/{id}
+    -> stops subprocess, frees port, deletes agents/{id}/ directory
+
+
+--------------------------------------------------------------------------------
+4. PORT SCHEME
+--------------------------------------------------------------------------------
+
+  8080            -> Manager admin API
+  7860, 7861, ... -> Agent WebRTC client ports (one per agent)
+  18000, 18001... -> Per-agent internal flow sidecar API ports
+
+
+--------------------------------------------------------------------------------
+5. CONFIG KEYS (passed in "config" object when creating an agent)
+--------------------------------------------------------------------------------
+
+  OPENAI_API_KEY     (required) - LLM inference
+  OPENAI_MODEL       (optional) - e.g. "gpt-4o"
+  OPENAI_BASE_URL    (optional) - custom LLM endpoint
+  DEEPGRAM_API_KEY   (required) - STT + fallback TTS
+  CARTESIA_API_KEY   (optional) - Cartesia TTS (falls back to Deepgram if missing)
+  TTS_PROVIDER       (optional) - "cartesia" or "deepgram" (default: "deepgram")
+  DEEPGRAM_TTS_VOICE (optional) - Deepgram voice ID
+  CARTESIA_TTS_VOICE (optional) - Cartesia voice ID
+
+
+--------------------------------------------------------------------------------
+6. PERSISTENCE & RESTARTS
+--------------------------------------------------------------------------------
+
+  - Registry saved to agents/registry.json after every change (atomic write)
+  - On manager restart: all agents with status "running" are auto re-spawned
+  - Agents with status "inactive" stay inactive until /activate is called
+
+
+--------------------------------------------------------------------------------
+7. ADMIN FRONTEND INTEGRATION FLOW (recommended)
+--------------------------------------------------------------------------------
+
+  1. Collect from admin: name, config (API keys/model), flow code
+  2. POST to /agents
+  3. Show returned client_url so admin/end-user can connect and test
+  4. Use GET /agents to render a dashboard with status + controls:
+     activate / deactivate / delete / edit flow
+
+
+--------------------------------------------------------------------------------
+8. SECURITY NOTE
+--------------------------------------------------------------------------------
+
+  The /agents API accepts and executes arbitrary Python code (flow_code) in
+  a subprocess. Do NOT expose port 8080 publicly without authentication
+  (API key header, IP allowlist, or auth middleware).
+
+
+--------------------------------------------------------------------------------
+SEE ALSO
+--------------------------------------------------------------------------------
+  README.md      - Full setup + API reference + troubleshooting
+  finalPlan.md   - Original design plan / architecture rationale
+  manager.py     - Manager source (all endpoints implemented here)
+  bot.py         - Per-agent runtime (loads FLOW_PATH env var)
+================================================================================

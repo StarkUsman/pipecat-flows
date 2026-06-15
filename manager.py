@@ -16,6 +16,7 @@ API:
   POST   /agents                 — create + start a new agent
   GET    /agents                 — list all agents
   GET    /agents/{id}            — get single agent details
+  GET    /agents/{id}/flow       — get an agent's current flow code
   PUT    /agents/{id}/flow       — hot-update an agent's flow code
   PUT    /agents/{id}/activate   — start a stopped agent
   PUT    /agents/{id}/deactivate — stop a running agent (keep config)
@@ -275,6 +276,17 @@ async def handle_get_agent(request: web.Request) -> web.Response:
     )
 
 
+async def handle_get_flow(request: web.Request) -> web.Response:
+    record = _registry.get(request.match_info["id"])
+    if not record:
+        return web.json_response({"error": "Not found"}, status=404)
+    try:
+        flow_code = Path(record.flow_path).read_text()
+    except FileNotFoundError:
+        flow_code = ""
+    return web.json_response({"flow_code": flow_code})
+
+
 async def handle_update_flow(request: web.Request) -> web.Response:
     record = _registry.get(request.match_info["id"])
     if not record:
@@ -364,6 +376,7 @@ async def main():
     app.router.add_post("/agents", handle_create_agent)
     app.router.add_get("/agents", handle_list_agents)
     app.router.add_get("/agents/{id}", handle_get_agent)
+    app.router.add_get("/agents/{id}/flow", handle_get_flow)
     app.router.add_put("/agents/{id}/flow", handle_update_flow)
     app.router.add_put("/agents/{id}/activate", handle_activate)
     app.router.add_put("/agents/{id}/deactivate", handle_deactivate)

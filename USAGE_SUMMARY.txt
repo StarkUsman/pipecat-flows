@@ -41,7 +41,7 @@ Endpoint:  POST http://localhost:8080/agents
 Body:
 {
   "name": "interview-bot",
-  "flow_code": "<the ENTIRE contents of a valid flow.py as a string>",
+  "flow_code": "<the ENTIRE contents of a valid flow.py as a string>" #<EMPTY_FOR_NEW>,
   "config": {
     "OPENAI_API_KEY": "sk-...",
     "OPENAI_MODEL": "gpt-4o",

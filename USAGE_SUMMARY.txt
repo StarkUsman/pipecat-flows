@@ -110,7 +110,7 @@ runs simultaneously, fully isolated from the first.
     -> restarts on the SAME port
 
   Permanently delete an agent:
-    DELETE /agents/{id}
+    DELETE /agents/{id}xi
     -> stops subprocess, frees port, deletes agents/{id}/ directory
 
 

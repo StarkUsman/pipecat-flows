@@ -32,12 +32,16 @@ import asyncio
 import importlib
 import importlib.util
 import os
+import uuid
+from datetime import datetime, timezone
 
 import aiohttp
 from aiohttp import web
 
 from dotenv import load_dotenv
 from loguru import logger
+
+import db
 
 print("🚀 Starting Pipecat bot...")
 print("⏳ Loading models and imports (20 seconds, first run only)\n")
@@ -54,6 +58,13 @@ logger.info("✅ Silero VAD model loaded")
 
 # Pipeline and core imports
 logger.info("Loading pipeline components...")
+from pipecat.frames.frames import EndFrame, LLMFullResponseEndFrame, MetricsFrame
+from pipecat.metrics.metrics import (
+    LLMUsageMetricsData,
+    TTFBMetricsData,
+    TTSUsageMetricsData,
+)
+from pipecat.observers.base_observer import BaseObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -236,9 +247,95 @@ def _build_tts_service():
         )
 
 
+class StatsCollector(BaseObserver):
+    """Accumulates per-conversation metrics from frames flowing through the pipeline.
+
+    Pipecat already emits these because the PipelineTask runs with
+    enable_metrics=True / enable_usage_metrics=True. We just tally them and expose a
+    summary that bot.py persists to agent_stats when the session ends.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+        self.tts_characters = 0
+        self.turns = 0
+        self.completed = False
+        self._llm_ttfb: list[float] = []
+        self._tts_ttfb: list[float] = []
+
+    async def on_push_frame(self, *args, **kwargs):
+        # Be tolerant of Pipecat's evolving observer signature: newer versions pass a
+        # single FramePushed object, older ones pass (src, dst, frame, ...).
+        frame = None
+        if args:
+            first = args[0]
+            frame = getattr(first, "frame", None)
+            if frame is None and len(args) >= 3:
+                frame = args[2]
+        if frame is None:
+            frame = kwargs.get("frame")
+        if frame is not None:
+            self._handle_frame(frame)
+
+    def _handle_frame(self, frame):
+        if isinstance(frame, MetricsFrame):
+            for item in getattr(frame, "data", []) or []:
+                self._handle_metric(item)
+        elif isinstance(frame, LLMFullResponseEndFrame):
+            self.turns += 1
+        elif isinstance(frame, EndFrame):
+            # Flow reached its end node (end_conversation post-action).
+            self.completed = True
+
+    def _handle_metric(self, item):
+        if isinstance(item, LLMUsageMetricsData):
+            usage = getattr(item, "value", None)
+            if usage is not None:
+                self.prompt_tokens += getattr(usage, "prompt_tokens", 0) or 0
+                self.completion_tokens += getattr(usage, "completion_tokens", 0) or 0
+                self.total_tokens += getattr(usage, "total_tokens", 0) or 0
+        elif isinstance(item, TTSUsageMetricsData):
+            self.tts_characters += getattr(item, "value", 0) or 0
+        elif isinstance(item, TTFBMetricsData):
+            value = getattr(item, "value", None)
+            if value is None:
+                return
+            processor = (getattr(item, "processor", "") or "").lower()
+            if "tts" in processor:
+                self._tts_ttfb.append(value)
+            else:
+                # Anything that isn't TTS (LLM, STT, …) counts toward response latency.
+                self._llm_ttfb.append(value)
+
+    @staticmethod
+    def _avg_ms(values: list[float]) -> float | None:
+        return (sum(values) / len(values)) * 1000 if values else None
+
+    def summary(self) -> dict:
+        return {
+            "turns": self.turns,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "tts_characters": self.tts_characters,
+            "avg_llm_ttfb_ms": self._avg_ms(self._llm_ttfb),
+            "avg_tts_ttfb_ms": self._avg_ms(self._tts_ttfb),
+        }
+
+
 async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
     async with aiohttp.ClientSession() as session:
         logger.info(f"Starting bot")
+
+        agent_id = os.getenv("AGENT_ID", "unknown")
+        agent_name = os.getenv("AGENT_NAME")
+        try:
+            await db.init_db()
+        except Exception as exc:
+            logger.warning(f"Stats DB unavailable, conversation stats disabled: {exc}")
 
         stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
         tts = _build_tts_service()
@@ -270,6 +367,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         context_aggregator = LLMContextAggregatorPair(context)
 
         rtvi = RTVIProcessor()
+        collector = StatsCollector()
 
         pipeline = Pipeline(
             [
@@ -293,7 +391,7 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
                 enable_usage_metrics=True,
                 allow_interruptions=True,
             ),
-            observers=[RTVIObserver(rtvi)],
+            observers=[RTVIObserver(rtvi), collector],
         )
 
         # Initialize flow manager in dynamic mode
@@ -304,9 +402,41 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             transport=transport,
         )
 
+        # Per-session stats state (mutable so the nested handlers can update it).
+        session = {"id": None, "started_at": None, "persisted": False}
+
+        async def _persist_stats(status: str, error: str | None = None):
+            if session["persisted"] or session["started_at"] is None:
+                return
+            session["persisted"] = True
+            ended_at = datetime.now(timezone.utc)
+            last_node = getattr(flow_manager, "current_node", None)
+            if last_node is not None and not isinstance(last_node, str):
+                last_node = getattr(last_node, "name", str(last_node))
+            row = {
+                "session_id": session["id"],
+                "agent_id": agent_id,
+                "agent_name": agent_name,
+                "started_at": session["started_at"],
+                "ended_at": ended_at,
+                "duration_seconds": (ended_at - session["started_at"]).total_seconds(),
+                "status": "completed" if collector.completed else status,
+                "last_node": last_node,
+                "error": error,
+                **collector.summary(),
+            }
+            try:
+                await db.insert_stats(row)
+                logger.info(f"Saved stats for session {session['id']} (status={row['status']})")
+            except Exception as exc:
+                logger.warning(f"Failed to persist conversation stats: {exc}")
+
         @transport.event_handler("on_client_connected")
         async def on_client_connected(transport, client):
             logger.info(f"Client connected")
+            session["id"] = uuid.uuid4().hex
+            session["started_at"] = datetime.now(timezone.utc)
+            session["persisted"] = False
             global flow_module
             try:
                 flow_module = _load_flow_module(_FLOW_PATH)
@@ -318,11 +448,20 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(transport, client):
             logger.info(f"Client disconnected")
+            await _persist_stats("disconnected")
             await task.cancel()
 
         runner = PipelineRunner(handle_sigint=runner_args.handle_sigint)
 
-        await runner.run(task)
+        try:
+            await runner.run(task)
+        except Exception as exc:
+            # Pipeline error mid-conversation — record it as a failed session.
+            await _persist_stats("failed", error=str(exc))
+            raise
+        else:
+            # Normal end without an explicit disconnect event (e.g. flow ended itself).
+            await _persist_stats("disconnected")
 
 
 async def bot(runner_args: RunnerArguments):

@@ -42,6 +42,32 @@ CREATE TABLE IF NOT EXISTS agents (
 );
 """
 
+# Per-conversation analytics. agent_id is plain text (no FK) so stats survive
+# agent deletion.
+_CREATE_STATS_TABLE = """
+CREATE TABLE IF NOT EXISTS agent_stats (
+    id                BIGSERIAL PRIMARY KEY,
+    session_id        TEXT NOT NULL,
+    agent_id          TEXT NOT NULL,
+    agent_name        TEXT,
+    started_at        TIMESTAMPTZ NOT NULL,
+    ended_at          TIMESTAMPTZ,
+    duration_seconds  DOUBLE PRECISION,
+    status            TEXT NOT NULL DEFAULT 'unknown',
+    last_node         TEXT,
+    turns             INTEGER DEFAULT 0,
+    prompt_tokens     BIGINT DEFAULT 0,
+    completion_tokens BIGINT DEFAULT 0,
+    total_tokens      BIGINT DEFAULT 0,
+    tts_characters    BIGINT DEFAULT 0,
+    avg_llm_ttfb_ms   DOUBLE PRECISION,
+    avg_tts_ttfb_ms   DOUBLE PRECISION,
+    error             TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_agent_stats_agent_id ON agent_stats(agent_id);
+"""
+
 _pool: asyncpg.Pool | None = None
 
 
@@ -61,11 +87,14 @@ async def _with_retry(label: str, op):
 
 
 async def init_db() -> None:
-    """Create the connection pool and ensure the agents table exists.
+    """Create the connection pool and ensure the agents/agent_stats tables exist.
 
-    Raises (crashing the manager) if Postgres is unreachable after the retries.
+    Idempotent — safe to call more than once per process. Raises (crashing the
+    caller) if Postgres is unreachable after the retries.
     """
     global _pool
+    if _pool is not None:
+        return
 
     async def _connect():
         return await asyncpg.create_pool(
@@ -79,7 +108,11 @@ async def init_db() -> None:
     _pool = await _with_retry("connect", _connect)
     async with _pool.acquire() as conn:
         await conn.execute(_CREATE_TABLE)
-    logger.info(f"Postgres connected ({PG_USER}@{PG_HOST}:{PG_PORT}/{PG_DATABASE}); agents table ready")
+        await conn.execute(_CREATE_STATS_TABLE)
+    logger.info(
+        f"Postgres connected ({PG_USER}@{PG_HOST}:{PG_PORT}/{PG_DATABASE}); "
+        "agents + agent_stats tables ready"
+    )
 
 
 async def upsert_agent(record, flow_code: str) -> None:
@@ -170,3 +203,100 @@ async def load_all() -> list[dict]:
         d["config"] = json.loads(config) if isinstance(config, str) else (config or {})
         result.append(d)
     return result
+
+
+# ── Per-conversation stats ──────────────────────────────────────────────────────
+
+async def insert_stats(row: dict) -> None:
+    """Insert one conversation's stats row into agent_stats."""
+
+    async def _op():
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO agent_stats
+                    (session_id, agent_id, agent_name, started_at, ended_at,
+                     duration_seconds, status, last_node, turns, prompt_tokens,
+                     completion_tokens, total_tokens, tts_characters,
+                     avg_llm_ttfb_ms, avg_tts_ttfb_ms, error)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                """,
+                row.get("session_id"),
+                row.get("agent_id"),
+                row.get("agent_name"),
+                row.get("started_at"),
+                row.get("ended_at"),
+                row.get("duration_seconds"),
+                row.get("status", "unknown"),
+                row.get("last_node"),
+                row.get("turns", 0),
+                row.get("prompt_tokens", 0),
+                row.get("completion_tokens", 0),
+                row.get("total_tokens", 0),
+                row.get("tts_characters", 0),
+                row.get("avg_llm_ttfb_ms"),
+                row.get("avg_tts_ttfb_ms"),
+                row.get("error"),
+            )
+
+    await _with_retry(f"insert_stats {row.get('agent_id')}", _op)
+
+
+# Shared aggregate projection used by both stats read functions.
+_STATS_AGG_COLUMNS = """
+    agent_id,
+    max(agent_name)                                       AS agent_name,
+    count(*)                                              AS total_sessions,
+    count(*) FILTER (WHERE status = 'completed')          AS completed_sessions,
+    count(*) FILTER (WHERE status = 'disconnected')       AS disconnected_sessions,
+    count(*) FILTER (WHERE status = 'failed')             AS failed_sessions,
+    coalesce(sum(prompt_tokens), 0)::bigint               AS prompt_tokens,
+    coalesce(sum(completion_tokens), 0)::bigint           AS completion_tokens,
+    coalesce(sum(total_tokens), 0)::bigint                AS total_tokens,
+    coalesce(sum(tts_characters), 0)::bigint              AS tts_characters,
+    coalesce(sum(turns), 0)::bigint                       AS total_turns,
+    avg(duration_seconds)                                 AS avg_duration_seconds,
+    avg(avg_llm_ttfb_ms)                                  AS avg_llm_ttfb_ms,
+    avg(avg_tts_ttfb_ms)                                  AS avg_tts_ttfb_ms,
+    max(ended_at)                                         AS last_session_at
+"""
+
+
+async def get_stats_all() -> list[dict]:
+    """Return one aggregate summary row per agent (across all stored sessions)."""
+
+    async def _op():
+        async with _pool.acquire() as conn:
+            return await conn.fetch(
+                f"SELECT {_STATS_AGG_COLUMNS} FROM agent_stats GROUP BY agent_id "
+                "ORDER BY total_sessions DESC"
+            )
+
+    rows = await _with_retry("get_stats_all", _op)
+    return [dict(r) for r in rows]
+
+
+async def get_stats_for_agent(agent_id: str, limit: int = 50) -> dict:
+    """Return an aggregate summary for one agent plus its most-recent sessions."""
+
+    async def _op():
+        async with _pool.acquire() as conn:
+            summary = await conn.fetchrow(
+                f"SELECT {_STATS_AGG_COLUMNS} FROM agent_stats WHERE agent_id = $1 "
+                "GROUP BY agent_id",
+                agent_id,
+            )
+            sessions = await conn.fetch(
+                "SELECT * FROM agent_stats WHERE agent_id = $1 "
+                "ORDER BY started_at DESC LIMIT $2",
+                agent_id,
+                limit,
+            )
+            return summary, sessions
+
+    summary, sessions = await _with_retry(f"get_stats_for_agent {agent_id}", _op)
+    return {
+        "agent_id": agent_id,
+        "summary": dict(summary) if summary else None,
+        "sessions": [dict(s) for s in sessions],
+    }

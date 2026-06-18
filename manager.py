@@ -38,6 +38,11 @@ from loguru import logger
 
 import db
 
+
+def _json_dumps(obj) -> str:
+    """json.dumps that tolerates datetime/Decimal values returned from Postgres."""
+    return json.dumps(obj, default=str)
+
 BASE_DIR = Path(__file__).parent
 AGENTS_DIR = BASE_DIR / "agents"
 REGISTRY_FILE = AGENTS_DIR / "registry.json"
@@ -160,6 +165,8 @@ async def _spawn(record: AgentRecord) -> None:
         **record.config,
         "FLOW_PATH": record.flow_path,
         "FLOW_API_PORT": str(record.flow_api_port),
+        "AGENT_ID": record.id,
+        "AGENT_NAME": record.name,
     }
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -353,6 +360,18 @@ async def handle_get_flow(request: web.Request) -> web.Response:
     return web.json_response({"flow_code": flow_code})
 
 
+async def handle_get_all_stats(request: web.Request) -> web.Response:
+    return web.json_response(await db.get_stats_all(), dumps=_json_dumps)
+
+
+async def handle_get_agent_stats(request: web.Request) -> web.Response:
+    agent_id = request.match_info["id"]
+    stats = await db.get_stats_for_agent(agent_id)
+    if agent_id not in _registry and not stats.get("sessions"):
+        return web.json_response({"error": "Not found"}, status=404)
+    return web.json_response(stats, dumps=_json_dumps)
+
+
 async def handle_update_flow(request: web.Request) -> web.Response:
     record = _registry.get(request.match_info["id"])
     if not record:
@@ -447,6 +466,10 @@ async def main():
     app = web.Application(middlewares=[cors_middleware])
     app.router.add_post("/agents", handle_create_agent)
     app.router.add_get("/agents", handle_list_agents)
+    # Register the static /agents/stats route BEFORE /agents/{id} so it isn't
+    # captured as id="stats".
+    app.router.add_get("/agents/stats", handle_get_all_stats)
+    app.router.add_get("/agents/{id}/stats", handle_get_agent_stats)
     app.router.add_get("/agents/{id}", handle_get_agent)
     app.router.add_get("/agents/{id}/flow", handle_get_flow)
     app.router.add_put("/agents/{id}/flow", handle_update_flow)

@@ -112,10 +112,54 @@ runs simultaneously, fully isolated from the first.
   Permanently delete an agent:
     DELETE /agents/{id}xi
     -> stops subprocess, frees port, deletes agents/{id}/ directory
+    -> historical conversation stats are KEPT (not deleted) for analytics
 
 
 --------------------------------------------------------------------------------
-4. PORT SCHEME
+4. CONVERSATION STATS / ANALYTICS
+--------------------------------------------------------------------------------
+
+Every conversation a running agent handles is recorded as one row in the
+Postgres `agent_stats` table when the call ends. Captured per session:
+
+  - token usage         (prompt_tokens, completion_tokens, total_tokens)
+  - conversation length (duration_seconds, started_at, ended_at)
+  - average latency     (avg_llm_ttfb_ms, avg_tts_ttfb_ms — time-to-first-byte)
+  - flow status         "completed"    -> flow reached its end node
+                        "disconnected" -> client left before the flow ended
+                        "failed"       -> the pipeline errored mid-conversation
+  - flow progress       (last_node — the node the conversation ended on)
+  - turns               (number of assistant responses)
+  - tts_characters      (characters synthesized)
+
+  Get aggregated stats for ALL agents:
+    GET /agents/stats
+    -> [ { "agent_id", "agent_name", "total_sessions",
+           "completed_sessions", "disconnected_sessions", "failed_sessions",
+           "prompt_tokens", "completion_tokens", "total_tokens",
+           "tts_characters", "total_turns", "avg_duration_seconds",
+           "avg_llm_ttfb_ms", "avg_tts_ttfb_ms", "last_session_at" }, ... ]
+    -> one summary object per agent (totals + averages across all its sessions)
+
+  Get stats for ONE agent (summary + recent sessions):
+    GET /agents/{id}/stats
+    -> {
+         "agent_id": "abc123",
+         "summary": { ...same aggregate fields as above... },
+         "sessions": [ { per-session row: session_id, status, duration_seconds,
+                         total_tokens, avg_llm_ttfb_ms, last_node, started_at,
+                         ended_at, ... }, ... ]   // most recent first (max 50)
+       }
+    -> 404 if the agent is unknown AND has no recorded stats
+
+  Notes:
+  - Stats are written by each agent's bot subprocess directly to Postgres; a
+    stats-write failure is logged but never interrupts a live call.
+  - Stats persist after an agent is deleted (kept for historical analytics).
+
+
+--------------------------------------------------------------------------------
+5. PORT SCHEME
 --------------------------------------------------------------------------------
 
   8080            -> Manager admin API
@@ -124,7 +168,7 @@ runs simultaneously, fully isolated from the first.
 
 
 --------------------------------------------------------------------------------
-5. CONFIG KEYS (passed in "config" object when creating an agent)
+6. CONFIG KEYS (passed in "config" object when creating an agent)
 --------------------------------------------------------------------------------
 
   OPENAI_API_KEY     (required) - LLM inference
@@ -138,16 +182,23 @@ runs simultaneously, fully isolated from the first.
 
 
 --------------------------------------------------------------------------------
-6. PERSISTENCE & RESTARTS
+7. PERSISTENCE & RESTARTS
 --------------------------------------------------------------------------------
 
-  - Registry saved to agents/registry.json after every change (atomic write)
-  - On manager restart: all agents with status "running" are auto re-spawned
-  - Agents with status "inactive" stay inactive until /activate is called
+  - Postgres is the source of truth: agent configs/flows/metadata are stored in
+    the `agents` table, and conversation analytics in the `agent_stats` table.
+  - Local mirror: agents/<id>/flow.py + config.json and agents/registry.json are
+    still written so the bot subprocess can read them.
+  - On manager restart: agents are restored from Postgres (DB wins — local files
+    are recreated/overwritten from the DB), then all agents with status "running"
+    are auto re-spawned. Agents with status "inactive" stay inactive until
+    /activate is called.
+  - DB connection is configured via PG_HOST / PG_PORT / PG_USER / PG_PASSWORD /
+    PG_DATABASE env vars (PG_MAX_RETRIES controls write retries before crashing).
 
 
 --------------------------------------------------------------------------------
-7. ADMIN FRONTEND INTEGRATION FLOW (recommended)
+8. ADMIN FRONTEND INTEGRATION FLOW (recommended)
 --------------------------------------------------------------------------------
 
   1. Collect from admin: name, config (API keys/model), flow code
@@ -155,10 +206,12 @@ runs simultaneously, fully isolated from the first.
   3. Show returned client_url so admin/end-user can connect and test
   4. Use GET /agents to render a dashboard with status + controls:
      activate / deactivate / delete / edit flow
+  5. Use GET /agents/stats (and /agents/{id}/stats) to render usage/analytics
+     dashboards: tokens, call volume, duration, latency, success rate
 
 
 --------------------------------------------------------------------------------
-8. SECURITY NOTE
+9. SECURITY NOTE
 --------------------------------------------------------------------------------
 
   The /agents API accepts and executes arbitrary Python code (flow_code) in

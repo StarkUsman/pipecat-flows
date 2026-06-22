@@ -37,6 +37,7 @@ from aiohttp import web
 from loguru import logger
 
 import db
+import services
 
 
 def _json_dumps(obj) -> str:
@@ -199,6 +200,24 @@ async def _terminate(record: AgentRecord) -> None:
 
 # ── Flow code helpers ─────────────────────────────────────────────────────────
 
+def _validate_providers(config: dict) -> str | None:
+    """Return an error message if config names an unknown STT/LLM/TTS provider."""
+    selectors = {
+        "stt": "STT_PROVIDER",
+        "llm": "LLM_PROVIDER",
+        "tts": "TTS_PROVIDER",
+    }
+    for modality, key in selectors.items():
+        value = config.get(key)
+        if value is None or value == "":
+            continue
+        provider = str(value).strip().lower()
+        known = services.KNOWN_PROVIDERS[modality]
+        if provider not in known:
+            return f"Unknown {key} '{value}'. Supported: {', '.join(known)}"
+    return None
+
+
 def _prepare_flow_code(code: str) -> str:
     """Auto-inject typing imports and validate syntax. Returns processed code."""
     needs_typing = any(name in code for name in _TYPING_NAMES)
@@ -265,6 +284,10 @@ async def handle_create_agent(request: web.Request) -> web.Response:
         return web.json_response({"error": "Missing 'flow_code'"}, status=400)
     if not isinstance(config, dict):
         return web.json_response({"error": "'config' must be an object"}, status=400)
+
+    provider_error = _validate_providers(config)
+    if provider_error:
+        return web.json_response({"error": provider_error}, status=400)
 
     try:
         flow_code = _prepare_flow_code(flow_code)

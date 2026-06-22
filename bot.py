@@ -77,13 +77,12 @@ from pipecat.transports.base_transport import BaseTransport, TransportParams
 from pipecat.transports.daily.transport import DailyParams
 
 # Service imports
-from pipecat.services.cartesia.tts import CartesiaTTSService
-from pipecat.services.deepgram.stt import DeepgramSTTService
-from pipecat.services.deepgram.tts import DeepgramTTSService
-from pipecat.services.openai.llm import OpenAILLMService
 from pipecat.services.heygen.api_interactive_avatar import AvatarQuality, NewSessionRequest
 #from pipecat.services.heygen.video import HeyGenVideoService
 from pipecat.services.tavus.video import TavusVideoService
+
+# Per-agent STT / LLM / TTS selection (config-driven, with graceful fallback).
+import services
 
 # Pipecat Flows imports
 from pipecat_flows import FlowManager
@@ -204,49 +203,6 @@ def _ensure_api_server_thread():
     thread.start()
 
 
-def _build_tts_service():
-    provider = os.getenv("TTS_PROVIDER", "deepgram").strip().lower()
-
-    def _has_real_value(value: str | None) -> bool:
-        return bool(value and value.strip() and not value.strip().lower().startswith("your_"))
-
-    if provider == "deepgram":
-        logger.warning("Using Deepgram TTS because TTS_PROVIDER=deepgram")
-        return DeepgramTTSService(
-            api_key=os.getenv("DEEPGRAM_API_KEY"),
-            settings=DeepgramTTSService.Settings(
-                voice=os.getenv("DEEPGRAM_TTS_VOICE", "aura-2-helena-en"),
-            ),
-        )
-
-    if not _has_real_value(os.getenv("CARTESIA_API_KEY")):
-        logger.warning(
-            "CARTESIA_API_KEY is missing or still a placeholder; falling back to Deepgram TTS"
-        )
-        return DeepgramTTSService(
-            api_key=os.getenv("DEEPGRAM_API_KEY"),
-            settings=DeepgramTTSService.Settings(
-                voice=os.getenv("DEEPGRAM_TTS_VOICE", "aura-2-helena-en"),
-            ),
-        )
-
-    try:
-        return CartesiaTTSService(
-            api_key=os.getenv("CARTESIA_API_KEY"),
-            settings=CartesiaTTSService.Settings(
-                voice=os.getenv("CARTESIA_TTS_VOICE", "e07c00bc-4134-4eae-9ea4-1a55fb45746b"),
-            ),
-        )
-    except Exception as error:
-        logger.warning(f"Cartesia TTS failed to initialize, falling back to Deepgram TTS: {error}")
-        return DeepgramTTSService(
-            api_key=os.getenv("DEEPGRAM_API_KEY"),
-            settings=DeepgramTTSService.Settings(
-                voice=os.getenv("DEEPGRAM_TTS_VOICE", "aura-2-helena-en"),
-            ),
-        )
-
-
 class StatsCollector(BaseObserver):
     """Accumulates per-conversation metrics from frames flowing through the pipeline.
 
@@ -337,15 +293,10 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
         except Exception as exc:
             logger.warning(f"Stats DB unavailable, conversation stats disabled: {exc}")
 
-        stt = DeepgramSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
-        tts = _build_tts_service()
-
-        #llm = OpenAILLMService(api_key=os.getenv("OPENAI_API_KEY"))
-        llm = OpenAILLMService(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            base_url=os.getenv("OPENAI_BASE_URL"),
-            model=os.getenv("OPENAI_MODEL"),
-        )
+        # STT / LLM / TTS are selected per agent from its config (env) — see services.py.
+        stt = services.build_stt_service()
+        llm = services.build_llm_service()
+        tts = services.build_tts_service()
 
         # tavus = TavusVideoService(
         #     api_key=os.getenv("TAVUS_API_KEY"),

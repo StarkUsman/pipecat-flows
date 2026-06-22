@@ -510,6 +510,11 @@ async def handle_delete_agent(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok"})
 
 
+async def handle_get_providers(request: web.Request) -> web.Response:
+    """Return the STT/LLM/TTS provider catalog (providers, models, voices, key env)."""
+    return web.json_response(services.PROVIDER_CATALOG)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 async def main():
@@ -523,6 +528,7 @@ async def main():
             await _spawn(record)
 
     app = web.Application(middlewares=[cors_middleware])
+    app.router.add_get("/providers", handle_get_providers)
     app.router.add_post("/agents", handle_create_agent)
     app.router.add_get("/agents", handle_list_agents)
     # Register the static /agents/stats route BEFORE /agents/{id} so it isn't

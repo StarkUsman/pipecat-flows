@@ -301,9 +301,90 @@ def build_tts_service():
     return _build_with_fallback("TTS", provider, _TTS_BUILDERS, DEFAULT_TTS)
 
 
-# Exposed for manager-side validation / introspection.
+# ── Provider catalog ──────────────────────────────────────────────────────────
+#
+# Single source of truth for what the UI offers: the providers each builder above
+# supports, the env var each one reads for its API key, default base URLs for the
+# OpenAI-compatible LLM hosts, and curated (advisory) model / voice lists. The
+# builders accept any model/voice string, so the frontend treats these lists as
+# suggestions and still allows free-text entry.
+
+# Deepgram Aura-2 voices (ids match the `aura-2-<name>-en` convention).
+_DEEPGRAM_VOICES = [
+    {"id": "aura-2-helena-en",   "name": "Helena",   "gender": "female", "accent": "American",  "description": "IVR, casual chat."},
+    {"id": "aura-2-asteria-en",  "name": "Asteria",  "gender": "female", "accent": "American",  "description": "Natural, conversational."},
+    {"id": "aura-2-hyperion-en", "name": "Hyperion", "gender": "male",   "accent": "Australian", "description": "Interview."},
+    {"id": "aura-2-amalthea-en", "name": "Amalthea", "gender": "female", "accent": "Filipino",  "description": "Casual chat."},
+    {"id": "aura-2-draco-en",    "name": "Draco",    "gender": "male",   "accent": "British",   "description": "Storytelling."},
+    {"id": "aura-2-electra-en",  "name": "Electra",  "gender": "female", "accent": "American",  "description": "IVR, advertising, customer service."},
+    {"id": "aura-2-pandora-en",  "name": "Pandora",  "gender": "female", "accent": "British",   "description": "IVR, informative."},
+    {"id": "aura-2-zeus-en",     "name": "Zeus",     "gender": "male",   "accent": "American",  "description": "IVR."},
+    {"id": "aura-2-athena-en",   "name": "Athena",   "gender": "female", "accent": "American",  "description": "Storytelling."},
+]
+
+_OPENAI_TTS_VOICES = [
+    {"id": "alloy",   "name": "Alloy",   "gender": "neutral", "accent": "American", "description": "Balanced, neutral."},
+    {"id": "echo",    "name": "Echo",    "gender": "male",    "accent": "American", "description": "Warm, measured."},
+    {"id": "fable",   "name": "Fable",   "gender": "neutral", "accent": "British",  "description": "Expressive, storytelling."},
+    {"id": "onyx",    "name": "Onyx",    "gender": "male",    "accent": "American", "description": "Deep, authoritative."},
+    {"id": "nova",    "name": "Nova",    "gender": "female",  "accent": "American", "description": "Bright, friendly."},
+    {"id": "shimmer", "name": "Shimmer", "gender": "female",  "accent": "American", "description": "Soft, gentle."},
+]
+
+_CARTESIA_VOICES = [
+    {"id": "e07c00bc-4134-4eae-9ea4-1a55fb45746b", "name": "Default (Sonic)", "gender": "neutral", "accent": "American", "description": "Natural, low-latency."},
+]
+
+_ELEVENLABS_VOICES = [
+    {"id": "EXAVITQu4vr4xnSDxMaL", "name": "Sarah",  "gender": "female", "accent": "American", "description": "Multilingual, natural."},
+    {"id": "21m00Tcm4TlvDq8ikWAM", "name": "Rachel", "gender": "female", "accent": "American", "description": "Calm, multilingual."},
+]
+
+PROVIDER_CATALOG = {
+    "stt": [
+        {"id": "deepgram",   "label": "Deepgram",   "apiKeyEnv": "DEEPGRAM_API_KEY",
+         "models": ["nova-3", "nova-2", "nova-2-general"]},
+        {"id": "assemblyai", "label": "AssemblyAI", "apiKeyEnv": "ASSEMBLYAI_API_KEY", "models": []},
+        {"id": "gladia",     "label": "Gladia",     "apiKeyEnv": "GLADIA_API_KEY",     "models": []},
+        {"id": "openai",     "label": "OpenAI (Whisper)", "apiKeyEnv": "OPENAI_API_KEY",
+         "models": ["whisper-1", "gpt-4o-transcribe", "gpt-4o-mini-transcribe"]},
+        {"id": "groq",       "label": "Groq (Whisper)",   "apiKeyEnv": "GROQ_API_KEY",
+         "models": ["whisper-large-v3", "whisper-large-v3-turbo"]},
+    ],
+    "llm": [
+        {"id": "openai",     "label": "OpenAI",     "apiKeyEnv": "OPENAI_API_KEY",
+         "models": ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini"]},
+        {"id": "anthropic",  "label": "Anthropic (Claude)", "apiKeyEnv": "ANTHROPIC_API_KEY",
+         "models": ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"]},
+        {"id": "google",     "label": "Google (Gemini)",    "apiKeyEnv": "GOOGLE_API_KEY",
+         "models": ["gemini-2.0-flash", "gemini-2.0-pro", "gemini-1.5-pro", "gemini-1.5-flash"]},
+        {"id": "groq",       "label": "Groq",       "apiKeyEnv": "GROQ_API_KEY", "baseUrl": _OPENAI_COMPAT_BASE_URLS["groq"],
+         "models": ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768", "gemma2-9b-it"]},
+        {"id": "openrouter", "label": "OpenRouter", "apiKeyEnv": "OPENROUTER_API_KEY", "baseUrl": _OPENAI_COMPAT_BASE_URLS["openrouter"], "models": []},
+        {"id": "together",   "label": "Together",   "apiKeyEnv": "TOGETHER_API_KEY",   "baseUrl": _OPENAI_COMPAT_BASE_URLS["together"],   "models": []},
+        {"id": "fireworks",  "label": "Fireworks",  "apiKeyEnv": "FIREWORKS_API_KEY",  "baseUrl": _OPENAI_COMPAT_BASE_URLS["fireworks"],  "models": []},
+        {"id": "deepseek",   "label": "DeepSeek",   "apiKeyEnv": "DEEPSEEK_API_KEY",   "baseUrl": _OPENAI_COMPAT_BASE_URLS["deepseek"],
+         "models": ["deepseek-chat", "deepseek-reasoner"]},
+        {"id": "cerebras",   "label": "Cerebras",   "apiKeyEnv": "CEREBRAS_API_KEY",   "baseUrl": _OPENAI_COMPAT_BASE_URLS["cerebras"],   "models": []},
+        {"id": "perplexity", "label": "Perplexity", "apiKeyEnv": "PERPLEXITY_API_KEY", "baseUrl": _OPENAI_COMPAT_BASE_URLS["perplexity"], "models": []},
+        {"id": "ollama",     "label": "Ollama (local)", "apiKeyEnv": None, "baseUrl": _OPENAI_COMPAT_BASE_URLS["ollama"], "models": []},
+    ],
+    "tts": [
+        {"id": "deepgram",   "label": "Deepgram (Aura-2)", "apiKeyEnv": "DEEPGRAM_API_KEY",
+         "models": [], "voices": _DEEPGRAM_VOICES},
+        {"id": "cartesia",   "label": "Cartesia",   "apiKeyEnv": "CARTESIA_API_KEY",
+         "models": [], "voices": _CARTESIA_VOICES},
+        {"id": "elevenlabs", "label": "ElevenLabs", "apiKeyEnv": "ELEVENLABS_API_KEY",
+         "models": ["eleven_flash_v2_5", "eleven_multilingual_v2", "eleven_turbo_v2_5"], "voices": _ELEVENLABS_VOICES},
+        {"id": "openai",     "label": "OpenAI",     "apiKeyEnv": "OPENAI_API_KEY",
+         "models": ["tts-1", "tts-1-hd", "gpt-4o-mini-tts"], "voices": _OPENAI_TTS_VOICES},
+    ],
+}
+
+
+# Exposed for manager-side validation / introspection — derived from the catalog
+# above so the two can't drift. (Catalog ids must match the builder dict keys.)
 KNOWN_PROVIDERS = {
-    "stt": sorted(_STT_BUILDERS),
-    "llm": sorted(_LLM_BUILDERS),
-    "tts": sorted(_TTS_BUILDERS),
+    modality: sorted(p["id"] for p in providers)
+    for modality, providers in PROVIDER_CATALOG.items()
 }

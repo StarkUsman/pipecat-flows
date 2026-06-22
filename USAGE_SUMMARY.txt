@@ -102,6 +102,12 @@ runs simultaneously, fully isolated from the first.
     Body: { "flow_code": "<new flow.py contents>" }
     -> takes effect on the NEXT client connection
 
+  Hot-update an agent's config (no restart needed):
+    PUT /agents/{id}/config
+    Body: { "config": { ...full config object, replaces existing... } }
+    -> full replace; takes effect on the NEXT client connection
+    -> in-progress calls keep using the previous config
+
   Pause an agent (keeps its config + flow + port reservation):
     PUT /agents/{id}/deactivate
 

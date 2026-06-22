@@ -178,6 +178,20 @@ async def update_flow(agent_id: str, flow_code: str, flow_path: str) -> None:
     await _with_retry(f"update_flow {agent_id}", _op)
 
 
+async def update_config(agent_id: str, config: dict) -> None:
+    """Update just the config (JSONB) of an agent."""
+
+    async def _op():
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE agents SET config = $2, updated_at = now() WHERE id = $1",
+                agent_id,
+                json.dumps(config),
+            )
+
+    await _with_retry(f"update_config {agent_id}", _op)
+
+
 async def delete_agent(agent_id: str) -> None:
     """Permanently remove an agent row."""
 

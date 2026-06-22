@@ -31,6 +31,7 @@ Required AI services:
 import asyncio
 import importlib
 import importlib.util
+import json
 import os
 import uuid
 from datetime import datetime, timezone
@@ -99,7 +100,41 @@ _FLOW_PATH = os.environ.get(
     "FLOW_PATH",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "flow.py"),
 )
+# Sibling of flow.py — re-read on each connection so config hot-updates take
+# effect on the NEXT call, mirroring the flow.py hot-reload (see run_bot).
+_CONFIG_PATH = os.path.join(os.path.dirname(_FLOW_PATH), "config.json")
+_applied_config_keys: set[str] = set()
 _api_server_started = False
+
+
+def _read_config_keys() -> dict:
+    """Return the 'config' dict from config.json (empty on any failure)."""
+    try:
+        with open(_CONFIG_PATH) as fh:
+            return (json.load(fh) or {}).get("config") or {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _reload_agent_config() -> None:
+    """Re-read config.json into os.environ (full replace) for the next call.
+
+    Applies every current config key and removes keys that were applied on the
+    previous reload but are now absent. Manager-owned env (FLOW_PATH,
+    FLOW_API_PORT, AGENT_ID, AGENT_NAME) and unrelated base-process env are left
+    untouched — only keys sourced from config.json are managed here.
+    """
+    global _applied_config_keys
+    cfg = _read_config_keys()
+    for stale in _applied_config_keys - set(cfg):
+        os.environ.pop(stale, None)
+    for key, value in cfg.items():
+        os.environ[key] = str(value)
+    _applied_config_keys = set(cfg)
+
+
+# Seed from the spawn-time config so the first reload's removal diff is correct.
+_applied_config_keys = set(_read_config_keys())
 
 
 def _load_flow_module(path: str):
@@ -292,6 +327,13 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments):
             await db.init_db()
         except Exception as exc:
             logger.warning(f"Stats DB unavailable, conversation stats disabled: {exc}")
+
+        # Re-read config.json into os.environ so config hot-updates apply to this
+        # (new) connection; in-progress calls keep their already-built services.
+        try:
+            _reload_agent_config()
+        except Exception as exc:
+            logger.error(f"config.json reload failed, using last good config: {exc}")
 
         # STT / LLM / TTS are selected per agent from its config (env) — see services.py.
         stt = services.build_stt_service()

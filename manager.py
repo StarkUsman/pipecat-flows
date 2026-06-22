@@ -18,6 +18,7 @@ API:
   GET    /agents/{id}            — get single agent details
   GET    /agents/{id}/flow       — get an agent's current flow code
   PUT    /agents/{id}/flow       — hot-update an agent's flow code
+  PUT    /agents/{id}/config     — hot-update an agent's config (full replace)
   PUT    /agents/{id}/activate   — start a stopped agent
   PUT    /agents/{id}/deactivate — stop a running agent (keep config)
   DELETE /agents/{id}            — permanently remove an agent
@@ -422,6 +423,41 @@ async def handle_update_flow(request: web.Request) -> web.Response:
     )
 
 
+async def handle_update_config(request: web.Request) -> web.Response:
+    record = _registry.get(request.match_info["id"])
+    if not record:
+        return web.json_response({"error": "Not found"}, status=404)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON body"}, status=400)
+
+    config = body.get("config")
+    if not isinstance(config, dict):
+        return web.json_response({"error": "'config' must be an object"}, status=400)
+
+    provider_error = _validate_providers(config)
+    if provider_error:
+        return web.json_response({"error": provider_error}, status=400)
+
+    # Persist to Postgres FIRST — if this fails (after retries) the error
+    # propagates and the agent keeps its previous config on disk and in memory.
+    await db.update_config(record.id, config)
+
+    record.config = config
+    agent_dir = AGENTS_DIR / record.id
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "config.json").write_text(
+        json.dumps({"name": record.name, "config": config}, indent=2)
+    )
+    _save_registry()
+    logger.info(f"Config updated for agent '{record.name}' ({record.id})")
+    return web.json_response(
+        {"status": "ok", "message": "Config updated — takes effect on next client connection"}
+    )
+
+
 async def handle_activate(request: web.Request) -> web.Response:
     record = _registry.get(request.match_info["id"])
     if not record:
@@ -496,6 +532,7 @@ async def main():
     app.router.add_get("/agents/{id}", handle_get_agent)
     app.router.add_get("/agents/{id}/flow", handle_get_flow)
     app.router.add_put("/agents/{id}/flow", handle_update_flow)
+    app.router.add_put("/agents/{id}/config", handle_update_config)
     app.router.add_put("/agents/{id}/activate", handle_activate)
     app.router.add_put("/agents/{id}/deactivate", handle_deactivate)
     app.router.add_delete("/agents/{id}", handle_delete_agent)

@@ -4,24 +4,32 @@ Dynamic multi-agent manager for pipecat-flows.
 Run with: python manager.py
 
 Agents are created, activated, deactivated, and deleted at runtime via REST API.
-Each agent runs as an isolated bot.py subprocess with its own flow file,
-API keys, and WebRTC port.
+Each agent runs as an isolated subprocess with its own flow file, API keys, and
+WebRTC port.
+
+Two agent flavours share this manager (same process/port and port pool), each
+with its own registry, Postgres tables, bot script, and route family:
+  - regular STT→LLM→TTS agents:  bot.py,     /agents,     /providers
+  - speech-to-speech agents:     sts_bot.py,  /STS/agents, /STS/providers
 
 Environment variables:
   MANAGER_PORT       — Admin API port (default: 8080)
   AGENT_BASE_PORT    — First WebRTC port for agents (default: 7860)
   FLOW_API_BASE_PORT — First sidecar flow-API port for agents (default: 18000)
 
-API:
-  POST   /agents                 — create + start a new agent
-  GET    /agents                 — list all agents
-  GET    /agents/{id}            — get single agent details
-  GET    /agents/{id}/flow       — get an agent's current flow code
-  PUT    /agents/{id}/flow       — hot-update an agent's flow code
-  PUT    /agents/{id}/config     — hot-update an agent's config (full replace)
-  PUT    /agents/{id}/activate   — start a stopped agent
-  PUT    /agents/{id}/deactivate — stop a running agent (keep config)
-  DELETE /agents/{id}            — permanently remove an agent
+API (mirrored under both /agents and /STS/agents):
+  POST   {prefix}                 — create + start a new agent
+  GET    {prefix}                 — list all agents
+  GET    {prefix}/stats           — aggregate stats across all agents
+  GET    {prefix}/{id}            — get single agent details
+  GET    {prefix}/{id}/stats      — per-agent stats + recent sessions
+  GET    {prefix}/{id}/flow       — get an agent's current flow code
+  PUT    {prefix}/{id}/flow       — hot-update an agent's flow code
+  PUT    {prefix}/{id}/config     — hot-update an agent's config (full replace)
+  PUT    {prefix}/{id}/activate   — start a stopped agent
+  PUT    {prefix}/{id}/deactivate — stop a running agent (keep config)
+  DELETE {prefix}/{id}            — permanently remove an agent
+  GET    /providers | /STS/providers — provider catalog for that flavour
 """
 
 import asyncio
@@ -30,9 +38,11 @@ import os
 import shutil
 import sys
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
+from typing import Callable
 
 from aiohttp import web
 from loguru import logger
@@ -71,28 +81,75 @@ class AgentRecord:
     created_at: str
 
 
-_registry: dict[str, AgentRecord] = {}
+@dataclass
+class AgentKind:
+    """Bundles everything that differs between the regular and speech-to-speech
+    agent flavours so the route handlers can stay generic. The process/port pools
+    are shared (ids are globally-unique uuids); only the registry, DB table, bot
+    script, provider validation, catalog, and route prefix differ."""
+
+    name: str                       # "agent" | "s2s" (log/label only)
+    bot_script: str                 # bot.py | sts_bot.py
+    agents_table: str               # db.AGENTS_TABLE | db.STS_AGENTS_TABLE
+    registry_file: Path
+    route_prefix: str               # "/agents" | "/STS/agents"
+    provider_selectors: dict        # modality -> env selector key, for validation
+    provider_catalog: object        # PROVIDER_CATALOG | S2S_PROVIDER_CATALOG
+    get_stats_all: Callable         # db.get_stats_all | db.get_sts_stats_all
+    get_stats_for_agent: Callable   # db.get_stats_for_agent | db.get_sts_stats_for_agent
+    registry: dict = field(default_factory=dict)
+
+
 _processes: dict[str, asyncio.subprocess.Process] = {}
 _used_ports: set[int] = set()
 _bg_tasks: set[asyncio.Task] = set()
 
 
+# Regular STT→LLM→TTS agents.
+AGENT_KIND = AgentKind(
+    name="agent",
+    bot_script="bot.py",
+    agents_table=db.AGENTS_TABLE,
+    registry_file=AGENTS_DIR / "registry.json",
+    route_prefix="/agents",
+    provider_selectors={"stt": "STT_PROVIDER", "llm": "LLM_PROVIDER", "tts": "TTS_PROVIDER"},
+    provider_catalog=services.PROVIDER_CATALOG,
+    get_stats_all=db.get_stats_all,
+    get_stats_for_agent=db.get_stats_for_agent,
+)
+
+# Speech-to-speech (realtime) agents.
+STS_KIND = AgentKind(
+    name="s2s",
+    bot_script="sts_bot.py",
+    agents_table=db.STS_AGENTS_TABLE,
+    registry_file=AGENTS_DIR / "sts_registry.json",
+    route_prefix="/STS/agents",
+    provider_selectors={"s2s": "STS_PROVIDER"},
+    provider_catalog=services.S2S_PROVIDER_CATALOG,
+    get_stats_all=db.get_sts_stats_all,
+    get_stats_for_agent=db.get_sts_stats_for_agent,
+)
+
+_KINDS = (AGENT_KIND, STS_KIND)
+
+
 # ── Persistence ───────────────────────────────────────────────────────────────
 
-def _save_registry() -> None:
+def _save_registry(kind: AgentKind) -> None:
     AGENTS_DIR.mkdir(parents=True, exist_ok=True)
-    data = {aid: asdict(rec) for aid, rec in _registry.items()}
-    tmp = REGISTRY_FILE.with_suffix(".tmp")
+    data = {aid: asdict(rec) for aid, rec in kind.registry.items()}
+    tmp = kind.registry_file.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2))
-    tmp.replace(REGISTRY_FILE)
+    tmp.replace(kind.registry_file)
 
 
-def _load_registry() -> None:
-    if not REGISTRY_FILE.exists():
+def _load_registry(kind: AgentKind) -> None:
+    if not kind.registry_file.exists():
         return
-    data = json.loads(REGISTRY_FILE.read_text())
+    data = json.loads(kind.registry_file.read_text())
     for agent_id, d in data.items():
-        _registry[agent_id] = AgentRecord(**d)
+        kind.registry[agent_id] = AgentRecord(**d)
         _used_ports.add(d["port"])
 
 
@@ -106,15 +163,15 @@ def _write_agent_files(record: AgentRecord, flow_code: str) -> None:
     )
 
 
-async def _restore_from_db() -> None:
-    """Make Postgres authoritative on startup.
+async def _restore_from_db(kind: AgentKind) -> None:
+    """Make Postgres authoritative on startup, per agent kind.
 
-    - If the DB has agents, rebuild the in-memory registry and overwrite the local
-      flow.py / config.json / registry.json from the DB rows (DB wins).
-    - If the DB is empty but local files exist, seed Postgres from them (one-time
-      migration so already-created file-based agents aren't lost on first deploy).
+    - If the DB table has agents, rebuild the in-memory registry and overwrite the
+      local flow.py / config.json / registry file from the DB rows (DB wins).
+    - If the table is empty but a local registry exists, seed Postgres from it
+      (one-time migration so already-created file-based agents aren't lost).
     """
-    rows = await db.load_all()
+    rows = await db.load_all(table=kind.agents_table)
 
     if rows:
         for d in rows:
@@ -129,23 +186,23 @@ async def _restore_from_db() -> None:
                 status=d["status"],
                 created_at=d["created_at"],
             )
-            _registry[record.id] = record
+            kind.registry[record.id] = record
             _used_ports.add(record.port)
             _write_agent_files(record, d.get("flow_code") or "")
-        _save_registry()
-        logger.info(f"Restored {len(rows)} agent(s) from Postgres (DB authoritative)")
+        _save_registry(kind)
+        logger.info(f"Restored {len(rows)} {kind.name} agent(s) from Postgres (DB authoritative)")
         return
 
-    # Empty DB → seed from any existing local files.
-    _load_registry()
-    if _registry:
-        logger.info(f"Postgres empty — seeding {len(_registry)} agent(s) from local files")
-        for record in _registry.values():
+    # Empty table → seed from any existing local files.
+    _load_registry(kind)
+    if kind.registry:
+        logger.info(f"Postgres empty — seeding {len(kind.registry)} {kind.name} agent(s) from local files")
+        for record in kind.registry.values():
             try:
                 flow_code = Path(record.flow_path).read_text()
             except FileNotFoundError:
                 flow_code = ""
-            await db.upsert_agent(record, flow_code)
+            await db.upsert_agent(record, flow_code, table=kind.agents_table)
 
 
 # ── Port management ───────────────────────────────────────────────────────────
@@ -161,7 +218,7 @@ def _alloc_ports() -> tuple[int, int]:
 
 # ── Subprocess management ─────────────────────────────────────────────────────
 
-async def _spawn(record: AgentRecord) -> None:
+async def _spawn(record: AgentRecord, kind: AgentKind) -> None:
     env = {
         **os.environ,
         **record.config,
@@ -172,19 +229,19 @@ async def _spawn(record: AgentRecord) -> None:
     }
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
-        str(BASE_DIR / "bot.py"),
+        str(BASE_DIR / kind.bot_script),
         "--port", str(record.port),
         env=env,
         cwd=str(BASE_DIR),
     )
     _processes[record.id] = proc
     record.status = "running"
-    _save_registry()
-    await db.update_status(record.id, record.status)
-    logger.info(f"Agent '{record.name}' ({record.id}) started — PID {proc.pid}, port {record.port}")
+    _save_registry(kind)
+    await db.update_status(record.id, record.status, table=kind.agents_table)
+    logger.info(f"{kind.name} agent '{record.name}' ({record.id}) started — PID {proc.pid}, port {record.port}")
 
 
-async def _terminate(record: AgentRecord) -> None:
+async def _terminate(record: AgentRecord, kind: AgentKind) -> None:
     proc = _processes.pop(record.id, None)
     if proc and proc.returncode is None:
         proc.terminate()
@@ -194,21 +251,16 @@ async def _terminate(record: AgentRecord) -> None:
             proc.kill()
             await proc.wait()
     record.status = "inactive"
-    _save_registry()
-    await db.update_status(record.id, record.status)
-    logger.info(f"Agent '{record.name}' ({record.id}) stopped")
+    _save_registry(kind)
+    await db.update_status(record.id, record.status, table=kind.agents_table)
+    logger.info(f"{kind.name} agent '{record.name}' ({record.id}) stopped")
 
 
 # ── Flow code helpers ─────────────────────────────────────────────────────────
 
-def _validate_providers(config: dict) -> str | None:
-    """Return an error message if config names an unknown STT/LLM/TTS provider."""
-    selectors = {
-        "stt": "STT_PROVIDER",
-        "llm": "LLM_PROVIDER",
-        "tts": "TTS_PROVIDER",
-    }
-    for modality, key in selectors.items():
+def _validate_providers(config: dict, kind: AgentKind) -> str | None:
+    """Return an error message if config names an unknown provider for this kind."""
+    for modality, key in kind.provider_selectors.items():
         value = config.get(key)
         if value is None or value == "":
             continue
@@ -255,21 +307,25 @@ def _agent_host(request: web.Request) -> str:
     return request.host.split(":")[0]
 
 
-def _live_status(record: AgentRecord) -> str:
+def _live_status(record: AgentRecord, kind: AgentKind) -> str:
     proc = _processes.get(record.id)
     if record.status == "running" and proc and proc.returncode is not None:
         record.status = "inactive"
-        _save_registry()
+        _save_registry(kind)
         # Best-effort DB sync; authoritative status is re-derived on the next op/restart.
-        task = asyncio.create_task(db.update_status(record.id, "inactive"))
+        task = asyncio.create_task(db.update_status(record.id, "inactive", table=kind.agents_table))
         _bg_tasks.add(task)
         task.add_done_callback(_bg_tasks.discard)
     return record.status
 
 
 # ── Route handlers ────────────────────────────────────────────────────────────
+#
+# Every handler takes the AgentKind it serves as its last argument; the routes are
+# registered with functools.partial(handler, kind=...) so the same code backs both
+# the /agents and /STS/agents endpoint families.
 
-async def handle_create_agent(request: web.Request) -> web.Response:
+async def handle_create_agent(request: web.Request, kind: AgentKind) -> web.Response:
     try:
         body = await request.json()
     except Exception:
@@ -286,7 +342,7 @@ async def handle_create_agent(request: web.Request) -> web.Response:
     if not isinstance(config, dict):
         return web.json_response({"error": "'config' must be an object"}, status=400)
 
-    provider_error = _validate_providers(config)
+    provider_error = _validate_providers(config, kind)
     if provider_error:
         return web.json_response({"error": provider_error}, status=400)
 
@@ -314,7 +370,7 @@ async def handle_create_agent(request: web.Request) -> web.Response:
 
     # Persist to Postgres FIRST — if this fails (after retries) the agent is not
     # saved: no files, no port reservation, no registry entry. Errors propagate.
-    await db.upsert_agent(record, flow_code)
+    await db.upsert_agent(record, flow_code, table=kind.agents_table)
 
     _used_ports.add(webrtc_port)
     agent_dir.mkdir(parents=True, exist_ok=True)
@@ -322,9 +378,9 @@ async def handle_create_agent(request: web.Request) -> web.Response:
     (agent_dir / "config.json").write_text(
         json.dumps({"name": name, "config": config}, indent=2)
     )
-    _registry[agent_id] = record
+    kind.registry[agent_id] = record
 
-    await _spawn(record)
+    await _spawn(record, kind)
 
     host = _agent_host(request)
     return web.json_response(
@@ -340,23 +396,23 @@ async def handle_create_agent(request: web.Request) -> web.Response:
     )
 
 
-async def handle_list_agents(request: web.Request) -> web.Response:
+async def handle_list_agents(request: web.Request, kind: AgentKind) -> web.Response:
     return web.json_response(
         [
             {
                 "id": r.id,
                 "name": r.name,
                 "port": r.port,
-                "status": _live_status(r),
+                "status": _live_status(r, kind),
                 "created_at": r.created_at,
             }
-            for r in _registry.values()
+            for r in kind.registry.values()
         ]
     )
 
 
-async def handle_get_agent(request: web.Request) -> web.Response:
-    record = _registry.get(request.match_info["id"])
+async def handle_get_agent(request: web.Request, kind: AgentKind) -> web.Response:
+    record = kind.registry.get(request.match_info["id"])
     if not record:
         return web.json_response({"error": "Not found"}, status=404)
     host = _agent_host(request)
@@ -366,15 +422,15 @@ async def handle_get_agent(request: web.Request) -> web.Response:
             "name": record.name,
             "port": record.port,
             "flow_api_port": record.flow_api_port,
-            "status": _live_status(record),
+            "status": _live_status(record, kind),
             "client_url": f"http://{host}:{record.port}/client",
             "created_at": record.created_at,
         }
     )
 
 
-async def handle_get_flow(request: web.Request) -> web.Response:
-    record = _registry.get(request.match_info["id"])
+async def handle_get_flow(request: web.Request, kind: AgentKind) -> web.Response:
+    record = kind.registry.get(request.match_info["id"])
     if not record:
         return web.json_response({"error": "Not found"}, status=404)
     try:
@@ -384,20 +440,20 @@ async def handle_get_flow(request: web.Request) -> web.Response:
     return web.json_response({"flow_code": flow_code})
 
 
-async def handle_get_all_stats(request: web.Request) -> web.Response:
-    return web.json_response(await db.get_stats_all(), dumps=_json_dumps)
+async def handle_get_all_stats(request: web.Request, kind: AgentKind) -> web.Response:
+    return web.json_response(await kind.get_stats_all(), dumps=_json_dumps)
 
 
-async def handle_get_agent_stats(request: web.Request) -> web.Response:
+async def handle_get_agent_stats(request: web.Request, kind: AgentKind) -> web.Response:
     agent_id = request.match_info["id"]
-    stats = await db.get_stats_for_agent(agent_id)
-    if agent_id not in _registry and not stats.get("sessions"):
+    stats = await kind.get_stats_for_agent(agent_id)
+    if agent_id not in kind.registry and not stats.get("sessions"):
         return web.json_response({"error": "Not found"}, status=404)
     return web.json_response(stats, dumps=_json_dumps)
 
 
-async def handle_update_flow(request: web.Request) -> web.Response:
-    record = _registry.get(request.match_info["id"])
+async def handle_update_flow(request: web.Request, kind: AgentKind) -> web.Response:
+    record = kind.registry.get(request.match_info["id"])
     if not record:
         return web.json_response({"error": "Not found"}, status=404)
 
@@ -415,16 +471,16 @@ async def handle_update_flow(request: web.Request) -> web.Response:
     except SyntaxError as exc:
         return web.json_response({"error": f"Syntax error in flow_code: {exc}"}, status=400)
 
-    await db.update_flow(record.id, flow_code, record.flow_path)
+    await db.update_flow(record.id, flow_code, record.flow_path, table=kind.agents_table)
     Path(record.flow_path).write_text(flow_code)
-    logger.info(f"Flow updated for agent '{record.name}' ({record.id})")
+    logger.info(f"Flow updated for {kind.name} agent '{record.name}' ({record.id})")
     return web.json_response(
         {"status": "ok", "message": "Flow updated — takes effect on next client connection"}
     )
 
 
-async def handle_update_config(request: web.Request) -> web.Response:
-    record = _registry.get(request.match_info["id"])
+async def handle_update_config(request: web.Request, kind: AgentKind) -> web.Response:
+    record = kind.registry.get(request.match_info["id"])
     if not record:
         return web.json_response({"error": "Not found"}, status=404)
 
@@ -437,13 +493,13 @@ async def handle_update_config(request: web.Request) -> web.Response:
     if not isinstance(config, dict):
         return web.json_response({"error": "'config' must be an object"}, status=400)
 
-    provider_error = _validate_providers(config)
+    provider_error = _validate_providers(config, kind)
     if provider_error:
         return web.json_response({"error": provider_error}, status=400)
 
     # Persist to Postgres FIRST — if this fails (after retries) the error
     # propagates and the agent keeps its previous config on disk and in memory.
-    await db.update_config(record.id, config)
+    await db.update_config(record.id, config, table=kind.agents_table)
 
     record.config = config
     agent_dir = AGENTS_DIR / record.id
@@ -451,15 +507,15 @@ async def handle_update_config(request: web.Request) -> web.Response:
     (agent_dir / "config.json").write_text(
         json.dumps({"name": record.name, "config": config}, indent=2)
     )
-    _save_registry()
-    logger.info(f"Config updated for agent '{record.name}' ({record.id})")
+    _save_registry(kind)
+    logger.info(f"Config updated for {kind.name} agent '{record.name}' ({record.id})")
     return web.json_response(
         {"status": "ok", "message": "Config updated — takes effect on next client connection"}
     )
 
 
-async def handle_activate(request: web.Request) -> web.Response:
-    record = _registry.get(request.match_info["id"])
+async def handle_activate(request: web.Request, kind: AgentKind) -> web.Response:
+    record = kind.registry.get(request.match_info["id"])
     if not record:
         return web.json_response({"error": "Not found"}, status=404)
 
@@ -467,81 +523,89 @@ async def handle_activate(request: web.Request) -> web.Response:
     if record.status == "running" and proc and proc.returncode is None:
         return web.json_response({"error": "Agent is already running"}, status=409)
 
-    await _spawn(record)
+    await _spawn(record, kind)
     host = _agent_host(request)
     return web.json_response(
         {"status": "ok", "port": record.port, "client_url": f"http://{host}:{record.port}/client"}
     )
 
 
-async def handle_deactivate(request: web.Request) -> web.Response:
-    record = _registry.get(request.match_info["id"])
+async def handle_deactivate(request: web.Request, kind: AgentKind) -> web.Response:
+    record = kind.registry.get(request.match_info["id"])
     if not record:
         return web.json_response({"error": "Not found"}, status=404)
 
-    if _live_status(record) == "inactive":
+    if _live_status(record, kind) == "inactive":
         return web.json_response({"error": "Agent is already inactive"}, status=409)
 
-    await _terminate(record)
+    await _terminate(record, kind)
     return web.json_response({"status": "ok", "message": "Agent stopped"})
 
 
-async def handle_delete_agent(request: web.Request) -> web.Response:
-    record = _registry.get(request.match_info["id"])
+async def handle_delete_agent(request: web.Request, kind: AgentKind) -> web.Response:
+    record = kind.registry.get(request.match_info["id"])
     if not record:
         return web.json_response({"error": "Not found"}, status=404)
 
     # Remove from Postgres first; if this fails (after retries) the error
     # propagates and the agent stays intact on disk and in the registry.
-    await db.delete_agent(record.id)
+    await db.delete_agent(record.id, table=kind.agents_table)
 
     if record.status == "running":
-        await _terminate(record)
+        await _terminate(record, kind)
 
     _used_ports.discard(record.port)
-    del _registry[record.id]
+    del kind.registry[record.id]
 
     agent_dir = AGENTS_DIR / record.id
     if agent_dir.exists():
         shutil.rmtree(agent_dir)
 
-    _save_registry()
-    logger.info(f"Agent '{record.name}' ({record.id}) deleted")
+    _save_registry(kind)
+    logger.info(f"{kind.name} agent '{record.name}' ({record.id}) deleted")
     return web.json_response({"status": "ok"})
 
 
-async def handle_get_providers(request: web.Request) -> web.Response:
-    """Return the STT/LLM/TTS provider catalog (providers, models, voices, key env)."""
-    return web.json_response(services.PROVIDER_CATALOG)
+async def handle_get_providers(request: web.Request, kind: AgentKind) -> web.Response:
+    """Return the provider catalog for this kind (providers, models, voices, key env)."""
+    return web.json_response(kind.provider_catalog)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _register_kind_routes(app: web.Application, kind: AgentKind, providers_path: str) -> None:
+    """Register the full CRUD/stats route family for one agent kind."""
+    p = kind.route_prefix
+    app.router.add_get(providers_path, partial(handle_get_providers, kind=kind))
+    app.router.add_post(p, partial(handle_create_agent, kind=kind))
+    app.router.add_get(p, partial(handle_list_agents, kind=kind))
+    # Register the static {prefix}/stats route BEFORE {prefix}/{id} so it isn't
+    # captured as id="stats".
+    app.router.add_get(f"{p}/stats", partial(handle_get_all_stats, kind=kind))
+    app.router.add_get(f"{p}/{{id}}/stats", partial(handle_get_agent_stats, kind=kind))
+    app.router.add_get(f"{p}/{{id}}", partial(handle_get_agent, kind=kind))
+    app.router.add_get(f"{p}/{{id}}/flow", partial(handle_get_flow, kind=kind))
+    app.router.add_put(f"{p}/{{id}}/flow", partial(handle_update_flow, kind=kind))
+    app.router.add_put(f"{p}/{{id}}/config", partial(handle_update_config, kind=kind))
+    app.router.add_put(f"{p}/{{id}}/activate", partial(handle_activate, kind=kind))
+    app.router.add_put(f"{p}/{{id}}/deactivate", partial(handle_deactivate, kind=kind))
+    app.router.add_delete(f"{p}/{{id}}", partial(handle_delete_agent, kind=kind))
+
+
 async def main():
     await db.init_db()
-    await _restore_from_db()
 
-    # Re-spawn agents that were running before the manager was stopped
-    for record in list(_registry.values()):
-        if record.status == "running":
-            logger.info(f"Re-spawning agent '{record.name}' ({record.id}) from registry")
-            await _spawn(record)
+    for kind in _KINDS:
+        await _restore_from_db(kind)
+        # Re-spawn agents that were running before the manager was stopped
+        for record in list(kind.registry.values()):
+            if record.status == "running":
+                logger.info(f"Re-spawning {kind.name} agent '{record.name}' ({record.id}) from registry")
+                await _spawn(record, kind)
 
     app = web.Application(middlewares=[cors_middleware])
-    app.router.add_get("/providers", handle_get_providers)
-    app.router.add_post("/agents", handle_create_agent)
-    app.router.add_get("/agents", handle_list_agents)
-    # Register the static /agents/stats route BEFORE /agents/{id} so it isn't
-    # captured as id="stats".
-    app.router.add_get("/agents/stats", handle_get_all_stats)
-    app.router.add_get("/agents/{id}/stats", handle_get_agent_stats)
-    app.router.add_get("/agents/{id}", handle_get_agent)
-    app.router.add_get("/agents/{id}/flow", handle_get_flow)
-    app.router.add_put("/agents/{id}/flow", handle_update_flow)
-    app.router.add_put("/agents/{id}/config", handle_update_config)
-    app.router.add_put("/agents/{id}/activate", handle_activate)
-    app.router.add_put("/agents/{id}/deactivate", handle_deactivate)
-    app.router.add_delete("/agents/{id}", handle_delete_agent)
+    _register_kind_routes(app, AGENT_KIND, providers_path="/providers")
+    _register_kind_routes(app, STS_KIND, providers_path="/STS/providers")
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -549,6 +613,8 @@ async def main():
     await site.start()
 
     logger.info(f"Manager API listening on :{MANAGER_PORT}")
+    logger.info(f"  regular agents:        /agents, /providers")
+    logger.info(f"  speech-to-speech (S2S): /STS/agents, /STS/providers")
     logger.info(f"Agent WebRTC ports start at {AGENT_BASE_PORT}")
     logger.info(f"Agent sidecar API ports start at {FLOW_API_BASE_PORT}")
 

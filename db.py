@@ -27,20 +27,34 @@ PG_DATABASE = os.environ.get("PG_DATABASE", "faraz")
 PG_MAX_RETRIES = int(os.environ.get("PG_MAX_RETRIES", "3"))
 _RETRY_BACKOFF_SECONDS = 1.0
 
-_CREATE_TABLE = """
-CREATE TABLE IF NOT EXISTS agents (
+# Table names — the agent CRUD/stats helpers are parameterized by these so the
+# speech-to-speech agents get their own tables without duplicating the SQL.
+AGENTS_TABLE = "agents"
+STS_AGENTS_TABLE = "sts_agents"
+STATS_TABLE = "agent_stats"
+STS_STATS_TABLE = "sts_agent_stats"
+
+
+def _create_agents_ddl(table: str) -> str:
+    return f"""
+CREATE TABLE IF NOT EXISTS {table} (
     id            TEXT PRIMARY KEY,
     name          TEXT        NOT NULL,
     port          INTEGER     NOT NULL,
     flow_api_port INTEGER     NOT NULL,
     flow_path     TEXT        NOT NULL,
-    config        JSONB       NOT NULL DEFAULT '{}',
+    config        JSONB       NOT NULL DEFAULT '{{}}',
     flow_code     TEXT        NOT NULL DEFAULT '',
     status        TEXT        NOT NULL DEFAULT 'inactive',
     created_at    TEXT        NOT NULL,
     updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 """
+
+
+_CREATE_TABLE = _create_agents_ddl(AGENTS_TABLE)
+# Speech-to-speech agents — identical schema, separate table.
+_CREATE_STS_TABLE = _create_agents_ddl(STS_AGENTS_TABLE)
 
 # Per-conversation analytics. agent_id is plain text (no FK) so stats survive
 # agent deletion.
@@ -66,6 +80,31 @@ CREATE TABLE IF NOT EXISTS agent_stats (
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_agent_stats_agent_id ON agent_stats(agent_id);
+"""
+
+# Speech-to-speech analytics. No STT/TTS stage, so the TTS-specific columns
+# (tts_characters / avg_tts_ttfb_ms) are dropped; avg_llm_ttfb_ms captures the
+# realtime model's response latency.
+_CREATE_STS_STATS_TABLE = """
+CREATE TABLE IF NOT EXISTS sts_agent_stats (
+    id                BIGSERIAL PRIMARY KEY,
+    session_id        TEXT NOT NULL,
+    agent_id          TEXT NOT NULL,
+    agent_name        TEXT,
+    started_at        TIMESTAMPTZ NOT NULL,
+    ended_at          TIMESTAMPTZ,
+    duration_seconds  DOUBLE PRECISION,
+    status            TEXT NOT NULL DEFAULT 'unknown',
+    last_node         TEXT,
+    turns             INTEGER DEFAULT 0,
+    prompt_tokens     BIGINT DEFAULT 0,
+    completion_tokens BIGINT DEFAULT 0,
+    total_tokens      BIGINT DEFAULT 0,
+    avg_llm_ttfb_ms   DOUBLE PRECISION,
+    error             TEXT,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_sts_agent_stats_agent_id ON sts_agent_stats(agent_id);
 """
 
 _pool: asyncpg.Pool | None = None
@@ -109,20 +148,22 @@ async def init_db() -> None:
     async with _pool.acquire() as conn:
         await conn.execute(_CREATE_TABLE)
         await conn.execute(_CREATE_STATS_TABLE)
+        await conn.execute(_CREATE_STS_TABLE)
+        await conn.execute(_CREATE_STS_STATS_TABLE)
     logger.info(
         f"Postgres connected ({PG_USER}@{PG_HOST}:{PG_PORT}/{PG_DATABASE}); "
-        "agents + agent_stats tables ready"
+        "agents + agent_stats + sts_agents + sts_agent_stats tables ready"
     )
 
 
-async def upsert_agent(record, flow_code: str) -> None:
-    """Insert or update an agent row (all columns)."""
+async def upsert_agent(record, flow_code: str, table: str = AGENTS_TABLE) -> None:
+    """Insert or update an agent row (all columns) in ``table``."""
 
     async def _op():
         async with _pool.acquire() as conn:
             await conn.execute(
-                """
-                INSERT INTO agents
+                f"""
+                INSERT INTO {table}
                     (id, name, port, flow_api_port, flow_path, config, flow_code, status, created_at, updated_at)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
                 ON CONFLICT (id) DO UPDATE SET
@@ -149,13 +190,13 @@ async def upsert_agent(record, flow_code: str) -> None:
     await _with_retry(f"upsert_agent {record.id}", _op)
 
 
-async def update_status(agent_id: str, status: str) -> None:
+async def update_status(agent_id: str, status: str, table: str = AGENTS_TABLE) -> None:
     """Update just the status of an agent."""
 
     async def _op():
         async with _pool.acquire() as conn:
             await conn.execute(
-                "UPDATE agents SET status = $2, updated_at = now() WHERE id = $1",
+                f"UPDATE {table} SET status = $2, updated_at = now() WHERE id = $1",
                 agent_id,
                 status,
             )
@@ -163,13 +204,13 @@ async def update_status(agent_id: str, status: str) -> None:
     await _with_retry(f"update_status {agent_id}", _op)
 
 
-async def update_flow(agent_id: str, flow_code: str, flow_path: str) -> None:
+async def update_flow(agent_id: str, flow_code: str, flow_path: str, table: str = AGENTS_TABLE) -> None:
     """Update just the flow code / path of an agent."""
 
     async def _op():
         async with _pool.acquire() as conn:
             await conn.execute(
-                "UPDATE agents SET flow_code = $2, flow_path = $3, updated_at = now() WHERE id = $1",
+                f"UPDATE {table} SET flow_code = $2, flow_path = $3, updated_at = now() WHERE id = $1",
                 agent_id,
                 flow_code,
                 flow_path,
@@ -178,13 +219,13 @@ async def update_flow(agent_id: str, flow_code: str, flow_path: str) -> None:
     await _with_retry(f"update_flow {agent_id}", _op)
 
 
-async def update_config(agent_id: str, config: dict) -> None:
+async def update_config(agent_id: str, config: dict, table: str = AGENTS_TABLE) -> None:
     """Update just the config (JSONB) of an agent."""
 
     async def _op():
         async with _pool.acquire() as conn:
             await conn.execute(
-                "UPDATE agents SET config = $2, updated_at = now() WHERE id = $1",
+                f"UPDATE {table} SET config = $2, updated_at = now() WHERE id = $1",
                 agent_id,
                 json.dumps(config),
             )
@@ -192,22 +233,22 @@ async def update_config(agent_id: str, config: dict) -> None:
     await _with_retry(f"update_config {agent_id}", _op)
 
 
-async def delete_agent(agent_id: str) -> None:
+async def delete_agent(agent_id: str, table: str = AGENTS_TABLE) -> None:
     """Permanently remove an agent row."""
 
     async def _op():
         async with _pool.acquire() as conn:
-            await conn.execute("DELETE FROM agents WHERE id = $1", agent_id)
+            await conn.execute(f"DELETE FROM {table} WHERE id = $1", agent_id)
 
     await _with_retry(f"delete_agent {agent_id}", _op)
 
 
-async def load_all() -> list[dict]:
+async def load_all(table: str = AGENTS_TABLE) -> list[dict]:
     """Return every agent row as a dict (config decoded to a dict)."""
 
     async def _op():
         async with _pool.acquire() as conn:
-            return await conn.fetch("SELECT * FROM agents")
+            return await conn.fetch(f"SELECT * FROM {table}")
 
     rows = await _with_retry("load_all", _op)
     result: list[dict] = []
@@ -309,6 +350,98 @@ async def get_stats_for_agent(agent_id: str, limit: int = 50) -> dict:
             return summary, sessions
 
     summary, sessions = await _with_retry(f"get_stats_for_agent {agent_id}", _op)
+    return {
+        "agent_id": agent_id,
+        "summary": dict(summary) if summary else None,
+        "sessions": [dict(s) for s in sessions],
+    }
+
+
+# ── Speech-to-speech (S2S) per-conversation stats ─────────────────────────────
+
+async def insert_sts_stats(row: dict) -> None:
+    """Insert one S2S conversation's stats row into sts_agent_stats."""
+
+    async def _op():
+        async with _pool.acquire() as conn:
+            await conn.execute(
+                f"""
+                INSERT INTO {STS_STATS_TABLE}
+                    (session_id, agent_id, agent_name, started_at, ended_at,
+                     duration_seconds, status, last_node, turns, prompt_tokens,
+                     completion_tokens, total_tokens, avg_llm_ttfb_ms, error)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                """,
+                row.get("session_id"),
+                row.get("agent_id"),
+                row.get("agent_name"),
+                row.get("started_at"),
+                row.get("ended_at"),
+                row.get("duration_seconds"),
+                row.get("status", "unknown"),
+                row.get("last_node"),
+                row.get("turns", 0),
+                row.get("prompt_tokens", 0),
+                row.get("completion_tokens", 0),
+                row.get("total_tokens", 0),
+                row.get("avg_llm_ttfb_ms"),
+                row.get("error"),
+            )
+
+    await _with_retry(f"insert_sts_stats {row.get('agent_id')}", _op)
+
+
+# Aggregate projection for S2S stats (no TTS columns).
+_STS_STATS_AGG_COLUMNS = """
+    agent_id,
+    max(agent_name)                                       AS agent_name,
+    count(*)                                              AS total_sessions,
+    count(*) FILTER (WHERE status = 'completed')          AS completed_sessions,
+    count(*) FILTER (WHERE status = 'disconnected')       AS disconnected_sessions,
+    count(*) FILTER (WHERE status = 'failed')             AS failed_sessions,
+    coalesce(sum(prompt_tokens), 0)::bigint               AS prompt_tokens,
+    coalesce(sum(completion_tokens), 0)::bigint           AS completion_tokens,
+    coalesce(sum(total_tokens), 0)::bigint                AS total_tokens,
+    coalesce(sum(turns), 0)::bigint                       AS total_turns,
+    avg(duration_seconds)                                 AS avg_duration_seconds,
+    avg(avg_llm_ttfb_ms)                                  AS avg_llm_ttfb_ms,
+    max(ended_at)                                         AS last_session_at
+"""
+
+
+async def get_sts_stats_all() -> list[dict]:
+    """Return one aggregate summary row per S2S agent (across all stored sessions)."""
+
+    async def _op():
+        async with _pool.acquire() as conn:
+            return await conn.fetch(
+                f"SELECT {_STS_STATS_AGG_COLUMNS} FROM {STS_STATS_TABLE} GROUP BY agent_id "
+                "ORDER BY total_sessions DESC"
+            )
+
+    rows = await _with_retry("get_sts_stats_all", _op)
+    return [dict(r) for r in rows]
+
+
+async def get_sts_stats_for_agent(agent_id: str, limit: int = 50) -> dict:
+    """Return an aggregate summary for one S2S agent plus its most-recent sessions."""
+
+    async def _op():
+        async with _pool.acquire() as conn:
+            summary = await conn.fetchrow(
+                f"SELECT {_STS_STATS_AGG_COLUMNS} FROM {STS_STATS_TABLE} WHERE agent_id = $1 "
+                "GROUP BY agent_id",
+                agent_id,
+            )
+            sessions = await conn.fetch(
+                f"SELECT * FROM {STS_STATS_TABLE} WHERE agent_id = $1 "
+                "ORDER BY started_at DESC LIMIT $2",
+                agent_id,
+                limit,
+            )
+            return summary, sessions
+
+    summary, sessions = await _with_retry(f"get_sts_stats_for_agent {agent_id}", _op)
     return {
         "agent_id": agent_id,
         "summary": dict(summary) if summary else None,

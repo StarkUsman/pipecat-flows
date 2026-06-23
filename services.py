@@ -22,6 +22,8 @@ from loguru import logger
 DEFAULT_STT = "deepgram"
 DEFAULT_LLM = "openai"
 DEFAULT_TTS = "deepgram"
+# Speech-to-speech (realtime multimodal LLM): audio in → audio out, no STT/TTS.
+DEFAULT_S2S = "openai_realtime"
 
 
 def _has_real_value(value: str | None) -> bool:
@@ -259,6 +261,150 @@ _TTS_BUILDERS = {
 }
 
 
+# ── Speech-to-speech (S2S) builders ───────────────────────────────────────────
+#
+# Realtime multimodal LLMs that take audio in and emit audio out directly — no
+# separate STT or TTS stage. The single returned service sits where the LLM sits
+# in the pipeline (see sts_bot.py). Voice/model are read from the shared
+# S2S_VOICE / S2S_MODEL env keys (with provider-specific fallbacks) so the
+# frontend can stay provider-agnostic.
+
+def _openai_realtime_settings(settings_cls, model: str | None, voice: str | None):
+    """Build an OpenAI-Realtime-style Settings object (shared by OpenAI + Azure).
+
+    Voice lives at ``session_properties.audio.output.voice`` in the realtime API,
+    so it can't be passed as a top-level kwarg. Returns None if nothing was set.
+    """
+    from pipecat.services.openai.realtime import events
+
+    kwargs = {}
+    if model:
+        kwargs["model"] = model
+    if voice:
+        kwargs["session_properties"] = events.SessionProperties(
+            audio=events.AudioConfiguration(output=events.AudioOutput(voice=voice))
+        )
+    return settings_cls(**kwargs) if kwargs else None
+
+
+def _build_openai_realtime_s2s():
+    from pipecat.services.openai.realtime.llm import OpenAIRealtimeLLMService
+
+    key = os.getenv("OPENAI_API_KEY")
+    if not _has_real_value(key):
+        raise ValueError("OPENAI_API_KEY is missing or a placeholder")
+    kwargs = {"api_key": key}
+    settings = _openai_realtime_settings(
+        OpenAIRealtimeLLMService.Settings,
+        _get("S2S_MODEL", "OPENAI_REALTIME_MODEL"),
+        _get("S2S_VOICE", "OPENAI_REALTIME_VOICE"),
+    )
+    if settings is not None:
+        kwargs["settings"] = settings
+    return OpenAIRealtimeLLMService(**kwargs)
+
+
+def _build_gemini_live_s2s():
+    from pipecat.services.google.gemini_live.llm import GeminiLiveLLMService
+
+    key = _get("GOOGLE_API_KEY", "GEMINI_API_KEY")
+    if not _has_real_value(key):
+        raise ValueError("GOOGLE_API_KEY (or GEMINI_API_KEY) is missing or a placeholder")
+    kwargs = {"api_key": key}
+    settings_kwargs = {}
+    model = _get("S2S_MODEL", "GEMINI_LIVE_MODEL")
+    if model:
+        settings_kwargs["model"] = model
+    voice = _get("S2S_VOICE", "GEMINI_LIVE_VOICE")
+    if voice:
+        settings_kwargs["voice"] = voice
+    if settings_kwargs:
+        kwargs["settings"] = GeminiLiveLLMService.Settings(**settings_kwargs)
+    return GeminiLiveLLMService(**kwargs)
+
+
+def _build_aws_nova_sonic_s2s():
+    from pipecat.services.aws.nova_sonic.llm import AWSNovaSonicLLMService
+
+    secret = os.getenv("AWS_SECRET_ACCESS_KEY")
+    access_key = os.getenv("AWS_ACCESS_KEY_ID")
+    if not _has_real_value(secret) or not _has_real_value(access_key):
+        raise ValueError("AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are missing or placeholders")
+    kwargs = {
+        "secret_access_key": secret,
+        "access_key_id": access_key,
+        "region": _get("AWS_REGION", default="us-east-1"),
+    }
+    session_token = os.getenv("AWS_SESSION_TOKEN")
+    if _has_real_value(session_token):
+        kwargs["session_token"] = session_token
+    model = _get("S2S_MODEL", "AWS_NOVA_SONIC_MODEL")
+    if model:
+        kwargs["model"] = model
+    voice = _get("S2S_VOICE", "AWS_NOVA_SONIC_VOICE")
+    if voice:
+        kwargs["voice_id"] = voice
+    return AWSNovaSonicLLMService(**kwargs)
+
+
+def _build_azure_realtime_s2s():
+    from pipecat.services.azure.realtime.llm import AzureRealtimeLLMService
+
+    key = _get("AZURE_API_KEY", "AZURE_OPENAI_API_KEY")
+    if not _has_real_value(key):
+        raise ValueError("AZURE_API_KEY (or AZURE_OPENAI_API_KEY) is missing or a placeholder")
+    base_url = _get("AZURE_REALTIME_URL", "S2S_BASE_URL")
+    if not _has_real_value(base_url):
+        raise ValueError("AZURE_REALTIME_URL (full Azure realtime WebSocket endpoint) is required")
+    kwargs = {"api_key": key, "base_url": base_url}
+    # Azure's deployment URL fixes the model, so only the voice is configurable here.
+    settings = _openai_realtime_settings(
+        AzureRealtimeLLMService.Settings, None, _get("S2S_VOICE", "AZURE_REALTIME_VOICE")
+    )
+    if settings is not None:
+        kwargs["settings"] = settings
+    return AzureRealtimeLLMService(**kwargs)
+
+
+def _build_xai_realtime_s2s():
+    from pipecat.services.xai.realtime.llm import GrokRealtimeLLMService
+
+    key = _get("XAI_API_KEY", "GROK_API_KEY")
+    if not _has_real_value(key):
+        raise ValueError("XAI_API_KEY (or GROK_API_KEY) is missing or a placeholder")
+    kwargs = {"api_key": key}
+    base_url = _get("XAI_REALTIME_URL")
+    if base_url:
+        kwargs["base_url"] = base_url
+    return GrokRealtimeLLMService(**kwargs)
+
+
+def _build_inworld_realtime_s2s():
+    from pipecat.services.inworld.realtime.llm import InworldRealtimeLLMService
+
+    key = os.getenv("INWORLD_API_KEY")
+    if not _has_real_value(key):
+        raise ValueError("INWORLD_API_KEY is missing or a placeholder")
+    kwargs = {"api_key": key}
+    model = _get("S2S_MODEL", "INWORLD_LLM_MODEL")
+    if model:
+        kwargs["llm_model"] = model
+    voice = _get("S2S_VOICE", "INWORLD_VOICE")
+    if voice:
+        kwargs["voice"] = voice
+    return InworldRealtimeLLMService(**kwargs)
+
+
+_S2S_BUILDERS = {
+    "openai_realtime": _build_openai_realtime_s2s,
+    "gemini_live": _build_gemini_live_s2s,
+    "aws_nova_sonic": _build_aws_nova_sonic_s2s,
+    "azure_realtime": _build_azure_realtime_s2s,
+    "xai_realtime": _build_xai_realtime_s2s,
+    "inworld_realtime": _build_inworld_realtime_s2s,
+}
+
+
 # ── Dispatcher ──────────────────────────────────────────────────────────────
 
 def _build_with_fallback(modality: str, provider: str, builders: dict, default: str):
@@ -299,6 +445,12 @@ def build_llm_service():
 def build_tts_service():
     provider = (os.getenv("TTS_PROVIDER", DEFAULT_TTS) or DEFAULT_TTS).strip().lower()
     return _build_with_fallback("TTS", provider, _TTS_BUILDERS, DEFAULT_TTS)
+
+
+def build_s2s_service():
+    """Build the realtime speech-to-speech LLM service (selected by S2S_PROVIDER)."""
+    provider = (os.getenv("S2S_PROVIDER", DEFAULT_S2S) or DEFAULT_S2S).strip().lower()
+    return _build_with_fallback("S2S", provider, _S2S_BUILDERS, DEFAULT_S2S)
 
 
 # ── Provider catalog ──────────────────────────────────────────────────────────
@@ -382,9 +534,72 @@ PROVIDER_CATALOG = {
 }
 
 
-# Exposed for manager-side validation / introspection — derived from the catalog
+# ── Speech-to-speech (S2S) provider catalog ───────────────────────────────────
+#
+# Array surfaced by GET /STS/providers. Each realtime provider bundles STT+LLM+TTS
+# internally, so a single voice/model selection drives the whole agent. Voices are
+# advisory suggestions — the builders accept any string and free-text is allowed.
+
+_OPENAI_REALTIME_VOICES = [
+    {"id": "alloy",   "name": "Alloy",   "gender": "neutral", "description": "Balanced, neutral."},
+    {"id": "echo",    "name": "Echo",    "gender": "male",    "description": "Warm, measured."},
+    {"id": "shimmer", "name": "Shimmer", "gender": "female",  "description": "Soft, gentle."},
+    {"id": "marin",   "name": "Marin",   "gender": "female",  "description": "Natural, conversational."},
+    {"id": "cedar",   "name": "Cedar",   "gender": "male",    "description": "Natural, conversational."},
+]
+
+_GEMINI_LIVE_VOICES = [
+    {"id": "Charon", "name": "Charon", "gender": "male",   "description": "Default, informative."},
+    {"id": "Puck",   "name": "Puck",   "gender": "male",   "description": "Upbeat."},
+    {"id": "Kore",   "name": "Kore",   "gender": "female", "description": "Firm."},
+    {"id": "Fenrir", "name": "Fenrir", "gender": "male",   "description": "Excitable."},
+    {"id": "Aoede",  "name": "Aoede",  "gender": "female", "description": "Breezy."},
+]
+
+_NOVA_SONIC_VOICES = [
+    {"id": "matthew", "name": "Matthew", "gender": "male",   "description": "American English."},
+    {"id": "tiffany", "name": "Tiffany", "gender": "female", "description": "American English."},
+    {"id": "amy",     "name": "Amy",     "gender": "female", "description": "British English."},
+]
+
+_XAI_REALTIME_VOICES = [
+    {"id": "Ara", "name": "Ara", "gender": "female", "description": "Default."},
+    {"id": "Rex", "name": "Rex", "gender": "male",   "description": "Grok realtime voice."},
+    {"id": "Eve", "name": "Eve", "gender": "female", "description": "Grok realtime voice."},
+    {"id": "Leo", "name": "Leo", "gender": "male",   "description": "Grok realtime voice."},
+]
+
+_INWORLD_VOICES = [
+    {"id": "Sarah", "name": "Sarah", "gender": "female", "description": "Inworld TTS voice."},
+    {"id": "Clive", "name": "Clive", "gender": "male",   "description": "Inworld TTS voice."},
+]
+
+# Array (not dict) so the frontend can list and pick in order.
+S2S_PROVIDER_CATALOG = [
+    {"id": "openai_realtime", "label": "OpenAI Realtime", "apiKeyEnv": "OPENAI_API_KEY",
+     "models": ["gpt-realtime-1.5", "gpt-4o-realtime-preview", "gpt-4o-mini-realtime-preview"],
+     "voices": _OPENAI_REALTIME_VOICES},
+    {"id": "gemini_live", "label": "Google Gemini Live", "apiKeyEnv": "GOOGLE_API_KEY",
+     "models": ["models/gemini-2.5-flash-native-audio-preview-12-2025",
+                "models/gemini-2.0-flash-live-001"],
+     "voices": _GEMINI_LIVE_VOICES},
+    {"id": "aws_nova_sonic", "label": "AWS Nova Sonic", "apiKeyEnv": "AWS_SECRET_ACCESS_KEY",
+     "models": ["amazon.nova-2-sonic-v1:0", "amazon.nova-sonic-v1:0"],
+     "voices": _NOVA_SONIC_VOICES},
+    {"id": "azure_realtime", "label": "Azure OpenAI Realtime", "apiKeyEnv": "AZURE_API_KEY",
+     "models": [], "voices": _OPENAI_REALTIME_VOICES},
+    {"id": "xai_realtime", "label": "xAI Grok Realtime", "apiKeyEnv": "XAI_API_KEY",
+     "models": [], "voices": _XAI_REALTIME_VOICES},
+    {"id": "inworld_realtime", "label": "Inworld Realtime", "apiKeyEnv": "INWORLD_API_KEY",
+     "models": ["openai/gpt-4.1-nano", "openai/gpt-4.1-mini"],
+     "voices": _INWORLD_VOICES},
+]
+
+
+# Exposed for manager-side validation / introspection — derived from the catalogs
 # above so the two can't drift. (Catalog ids must match the builder dict keys.)
 KNOWN_PROVIDERS = {
     modality: sorted(p["id"] for p in providers)
     for modality, providers in PROVIDER_CATALOG.items()
 }
+KNOWN_PROVIDERS["s2s"] = sorted(p["id"] for p in S2S_PROVIDER_CATALOG)

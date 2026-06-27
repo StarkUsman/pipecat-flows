@@ -5,9 +5,12 @@ description = "Quickstart example for building voice AI bots with Pipecat"
 requires-python = ">=3.10"
 dependencies = [
     "pipecat-ai-flows>=0.0.21",
-    "pipecat-ai[anthropic,assemblyai,aws-nova-sonic,azure,cartesia,daily,deepgram,elevenlabs,gladia,google,groq,heygen,inworld,local-smart-turn-v3,openai,runner,silero,webrtc,xai]>=0.0.86",
+    "pipecat-ai[anthropic,assemblyai,aws-nova-sonic,azure,cartesia,daily,deepgram,elevenlabs,gladia,google,groq,heygen,inworld,local-smart-turn-v3,openai,runner,silero,webrtc,websocket,xai]>=0.0.86",
     "pipecatcloud>=0.2.4",
     "asyncpg>=0.29",
+    # SIP gateway (FreeSWITCH mod_audio_stream → Pipecat) — see sip_gateway.py.
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
 ]
 
 [dependency-groups]
